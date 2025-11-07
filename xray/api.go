@@ -1,18 +1,13 @@
-// Package xray provides integration with the Xray proxy core.
-// It includes API client functionality, configuration management, traffic monitoring,
-// and process control for Xray instances.
+// Package xray provides client integration with the Xray proxy core.
 package xray
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
-	"regexp"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/logger"
-	"github.com/mhsanaei/3x-ui/v2/util/common"
 
 	"github.com/xtls/xray-core/app/proxyman/command"
 	statsService "github.com/xtls/xray-core/app/stats/command"
@@ -25,83 +20,98 @@ import (
 	"github.com/xtls/xray-core/proxy/vless"
 	"github.com/xtls/xray-core/proxy/vmess"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// XrayAPI is a gRPC client for managing Xray core configuration, inbounds, outbounds, and statistics.
+// Magic values
+const (
+	apiInboundTag = "api"
+)
+
+// XrayAPI is a gRPC client for managing Xray core.
+// Thread-safe - can be used concurrently.
 type XrayAPI struct {
-	HandlerServiceClient *command.HandlerServiceClient
-	StatsServiceClient   *statsService.StatsServiceClient
+	HandlerServiceClient command.HandlerServiceClient
+	StatsServiceClient   statsService.StatsServiceClient
 	grpcClient           *grpc.ClientConn
-	isConnected          bool
 }
 
-// Init connects to the Xray API server and initializes handler and stats service clients.
-func (x *XrayAPI) Init(apiPort int) error {
-	if apiPort <= 0 || apiPort > math.MaxUint16 {
-		return fmt.Errorf("invalid Xray API port: %d", apiPort)
-	}
+// NewXrayAPI creates a new XrayAPI client.
+// host and port must be valid (validated by caller).
+func NewXrayAPI(host string, port int) (*XrayAPI, error) {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	logger.Info("Connecting to Xray gRPC API at:", addr)
 
-	addr := fmt.Sprintf("127.0.0.1:%d", apiPort)
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return fmt.Errorf("failed to connect to Xray API: %w", err)
+		return nil, fmt.Errorf("failed to connect to Xray API at %s: %w", addr, err)
 	}
 
-	x.grpcClient = conn
-	x.isConnected = true
+	api := &XrayAPI{
+		grpcClient:           conn,
+		HandlerServiceClient: command.NewHandlerServiceClient(conn),
+		StatsServiceClient:   statsService.NewStatsServiceClient(conn),
+	}
 
-	hsClient := command.NewHandlerServiceClient(conn)
-	ssClient := statsService.NewStatsServiceClient(conn)
+	logger.Info("Xray connection established")
+	return api, nil
+}
 
-	x.HandlerServiceClient = &hsClient
-	x.StatsServiceClient = &ssClient
+// IsConnected checks if connection is active.
+func (x *XrayAPI) IsConnected() bool {
+	if x == nil || x.grpcClient == nil {
+		return false
+	}
+	state := x.grpcClient.GetState()
+	return state == connectivity.Ready || state == connectivity.Idle
+}
+
+// Close closes the connection.
+func (x *XrayAPI) Close() {
+	if x.grpcClient != nil {
+		logger.Info("Closing Xray connection")
+		x.grpcClient.Close()
+	}
+}
+
+// AddInbound adds a new inbound configuration to Xray.
+func (x *XrayAPI) AddInbound(inbound []byte) error {
+	conf := new(conf.InboundDetourConfig)
+	if err := json.Unmarshal(inbound, conf); err != nil {
+		return fmt.Errorf("invalid inbound configuration: %w", err)
+	}
+
+	config, err := conf.Build()
+	if err != nil {
+		return fmt.Errorf("invalid inbound settings: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = x.HandlerServiceClient.AddInbound(ctx, &command.AddInboundRequest{Inbound: config})
+	if err != nil {
+		return fmt.Errorf("failed to add inbound: %w", err)
+	}
 
 	return nil
 }
 
-// Close closes the gRPC connection and resets the XrayAPI client state.
-func (x *XrayAPI) Close() {
-	if x.grpcClient != nil {
-		x.grpcClient.Close()
-	}
-	x.HandlerServiceClient = nil
-	x.StatsServiceClient = nil
-	x.isConnected = false
-}
-
-// AddInbound adds a new inbound configuration to the Xray core via gRPC.
-func (x *XrayAPI) AddInbound(inbound []byte) error {
-	client := *x.HandlerServiceClient
-
-	conf := new(conf.InboundDetourConfig)
-	err := json.Unmarshal(inbound, conf)
-	if err != nil {
-		logger.Debug("Failed to unmarshal inbound:", err)
-		return err
-	}
-	config, err := conf.Build()
-	if err != nil {
-		logger.Debug("Failed to build inbound Detur:", err)
-		return err
-	}
-	inboundConfig := command.AddInboundRequest{Inbound: config}
-
-	_, err = client.AddInbound(context.Background(), &inboundConfig)
-
-	return err
-}
-
-// DelInbound removes an inbound configuration from the Xray core by tag.
+// DelInbound removes an inbound by tag.
 func (x *XrayAPI) DelInbound(tag string) error {
-	client := *x.HandlerServiceClient
-	_, err := client.RemoveInbound(context.Background(), &command.RemoveInboundRequest{
-		Tag: tag,
-	})
-	return err
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := x.HandlerServiceClient.RemoveInbound(ctx, &command.RemoveInboundRequest{Tag: tag})
+	if err != nil {
+		return fmt.Errorf("failed to remove inbound: %w", err)
+	}
+	return nil
 }
 
-// AddUser adds a user to an inbound in the Xray core using the specified protocol and user data.
+// AddUser adds a user to an inbound.
+// Supported protocols: vless, vmess, trojan, shadowsocks, shadowsocks-2022.
 func (x *XrayAPI) AddUser(Protocol string, inboundTag string, user map[string]any) error {
 	var account *serial.TypedMessage
 	switch Protocol {
@@ -148,9 +158,10 @@ func (x *XrayAPI) AddUser(Protocol string, inboundTag string, user map[string]an
 		return nil
 	}
 
-	client := *x.HandlerServiceClient
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	_, err := client.AlterInbound(context.Background(), &command.AlterInboundRequest{
+	_, err := x.HandlerServiceClient.AlterInbound(ctx, &command.AlterInboundRequest{
 		Tag: inboundTag,
 		Operation: serial.ToTypedMessage(&command.AddUserOperation{
 			User: &protocol.User{
@@ -159,10 +170,14 @@ func (x *XrayAPI) AddUser(Protocol string, inboundTag string, user map[string]an
 			},
 		}),
 	})
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to add user: %w", err)
+	}
+
+	return nil
 }
 
-// RemoveUser removes a user from an inbound in the Xray core by email.
+// RemoveUser removes a user from an inbound by email.
 func (x *XrayAPI) RemoveUser(inboundTag, email string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -173,7 +188,7 @@ func (x *XrayAPI) RemoveUser(inboundTag, email string) error {
 		Operation: serial.ToTypedMessage(op),
 	}
 
-	_, err := (*x.HandlerServiceClient).AlterInbound(ctx, req)
+	_, err := x.HandlerServiceClient.AlterInbound(ctx, req)
 	if err != nil {
 		return fmt.Errorf("failed to remove user: %w", err)
 	}
@@ -181,23 +196,33 @@ func (x *XrayAPI) RemoveUser(inboundTag, email string) error {
 	return nil
 }
 
-// GetTraffic queries traffic statistics from the Xray core, optionally resetting counters.
-func (x *XrayAPI) GetTraffic(reset bool) ([]*Traffic, []*ClientTraffic, error) {
-	if x.grpcClient == nil {
-		return nil, nil, common.NewError("xray api is not initialized")
-	}
-
-	trafficRegex := regexp.MustCompile(`(inbound|outbound)>>>([^>]+)>>>traffic>>>(downlink|uplink)`)
-	clientTrafficRegex := regexp.MustCompile(`user>>>([^>]+)>>>traffic>>>(downlink|uplink)`)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+// ListInboundTags returns all currently running inbound tags.
+func (x *XrayAPI) ListInboundTags() ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if x.StatsServiceClient == nil {
-		return nil, nil, common.NewError("xray StatusServiceClient is not initialized")
+	resp, err := x.HandlerServiceClient.ListInbounds(ctx, &command.ListInboundsRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get inbound list: %w", err)
 	}
 
-	resp, err := (*x.StatsServiceClient).QueryStats(ctx, &statsService.QueryStatsRequest{Reset_: reset})
+	var tags []string
+	if resp != nil && resp.Inbounds != nil {
+		for _, inbound := range resp.Inbounds {
+			if inbound != nil && inbound.Tag != "" {
+				tags = append(tags, inbound.Tag)
+			}
+		}
+	}
+	return tags, nil
+}
+
+// GetTraffic retrieves traffic statistics, optionally resetting counters.
+func (x *XrayAPI) GetTraffic(reset bool) ([]*Traffic, []*ClientTraffic, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := x.StatsServiceClient.QueryStats(ctx, &statsService.QueryStatsRequest{Reset_: reset})
 	if err != nil {
 		logger.Debug("Failed to query Xray stats:", err)
 		return nil, nil, err
@@ -207,24 +232,61 @@ func (x *XrayAPI) GetTraffic(reset bool) ([]*Traffic, []*ClientTraffic, error) {
 	emailTrafficMap := make(map[string]*ClientTraffic)
 
 	for _, stat := range resp.GetStat() {
-		if matches := trafficRegex.FindStringSubmatch(stat.Name); len(matches) == 4 {
-			processTraffic(matches, stat.Value, tagTrafficMap)
-		} else if matches := clientTrafficRegex.FindStringSubmatch(stat.Name); len(matches) == 3 {
-			processClientTraffic(matches, stat.Value, emailTrafficMap)
-		}
+		processStatistic(stat.Name, stat.Value, tagTrafficMap, emailTrafficMap)
 	}
 	return mapToSlice(tagTrafficMap), mapToSlice(emailTrafficMap), nil
 }
 
-// processTraffic aggregates a traffic stat into trafficMap using regex matches and value.
-func processTraffic(matches []string, value int64, trafficMap map[string]*Traffic) {
-	isInbound := matches[1] == "inbound"
-	tag := matches[2]
-	isDown := matches[3] == "downlink"
-
-	if tag == "api" {
+// processStatistic parses and aggregates a single stat entry.
+// Stat name format: "inbound>>>tag>>>traffic>>>uplink" or "user>>>email>>>traffic>>>downlink"
+func processStatistic(name string, value int64, trafficMap map[string]*Traffic, clientTrafficMap map[string]*ClientTraffic) {
+	parts := splitStatName(name)
+	if len(parts) < 4 {
 		return
 	}
+
+	// Check stat type: inbound/outbound/user
+	switch parts[0] {
+	case "inbound", "outbound":
+		processInboundOutboundTraffic(parts, value, trafficMap)
+	case "user":
+		processClientTraffic(parts, value, clientTrafficMap)
+	}
+}
+
+// splitStatName splits stat name by ">>>" separator (faster than regex)
+func splitStatName(name string) []string {
+	parts := make([]string, 0, 4)
+	start := 0
+
+	for i := 0; i < len(name)-2; i++ {
+		if name[i] == '>' && name[i+1] == '>' && name[i+2] == '>' {
+			parts = append(parts, name[start:i])
+			start = i + 3
+			i += 2 // Skip '>>'
+		}
+	}
+	// Add last part
+	if start < len(name) {
+		parts = append(parts, name[start:])
+	}
+	return parts
+}
+
+// processInboundOutboundTraffic aggregates inbound/outbound traffic statistics.
+// parts: ["inbound/outbound", "tag", "traffic", "uplink/downlink"]
+func processInboundOutboundTraffic(parts []string, value int64, trafficMap map[string]*Traffic) {
+	if len(parts) != 4 || parts[2] != "traffic" {
+		return
+	}
+
+	tag := parts[1]
+	if tag == apiInboundTag {
+		return
+	}
+
+	isInbound := parts[0] == "inbound"
+	isDown := parts[3] == "downlink"
 
 	traffic, ok := trafficMap[tag]
 	if !ok {
@@ -243,10 +305,15 @@ func processTraffic(matches []string, value int64, trafficMap map[string]*Traffi
 	}
 }
 
-// processClientTraffic updates clientTrafficMap with upload/download values for a client email.
-func processClientTraffic(matches []string, value int64, clientTrafficMap map[string]*ClientTraffic) {
-	email := matches[1]
-	isDown := matches[2] == "downlink"
+// processClientTraffic aggregates client traffic statistics.
+// parts: ["user", "email", "traffic", "uplink/downlink"]
+func processClientTraffic(parts []string, value int64, clientTrafficMap map[string]*ClientTraffic) {
+	if len(parts) != 4 || parts[2] != "traffic" {
+		return
+	}
+
+	email := parts[1]
+	isDown := parts[3] == "downlink"
 
 	traffic, ok := clientTrafficMap[email]
 	if !ok {

@@ -99,7 +99,7 @@ type Server struct {
 	panel *controller.XUIController
 	api   *controller.APIController
 
-	xrayService    service.XrayService
+	xrayService    *service.XrayService
 	settingService service.SettingService
 	tgbotService   service.Tgbot
 
@@ -109,12 +109,16 @@ type Server struct {
 	cancel context.CancelFunc
 }
 
-// NewServer creates a new web server instance with a cancellable context.
+// NewServer creates a new web server instance.
 func NewServer() *Server {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	xrayService := service.NewXrayService()
+
 	return &Server{
-		ctx:    ctx,
-		cancel: cancel,
+		ctx:         ctx,
+		cancel:      cancel,
+		xrayService: xrayService,
 	}
 }
 
@@ -264,7 +268,7 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 
 	s.index = controller.NewIndexController(g)
 	s.panel = controller.NewXUIController(g)
-	s.api = controller.NewAPIController(g)
+	s.api = controller.NewAPIController(g, s.xrayService)
 
 	// Chrome DevTools endpoint for debugging web apps
 	engine.GET("/.well-known/appspecific/com.chrome.devtools.json", func(c *gin.Context) {
@@ -279,31 +283,12 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	return engine, nil
 }
 
-// startTask schedules background jobs (Xray checks, traffic jobs, cron
-// jobs) which the panel relies on for periodic maintenance and monitoring.
+// startTask schedules background jobs (traffic monitoring, cron jobs, etc.)
+// which the panel relies on for periodic maintenance and monitoring.
 func (s *Server) startTask() {
-	err := s.xrayService.RestartXray(true)
-	if err != nil {
-		logger.Warning("start xray failed:", err)
-	}
-	// Check whether xray is running every second
-	s.cron.AddJob("@every 1s", job.NewCheckXrayRunningJob())
-
-	// Check if xray needs to be restarted every 30 seconds
-	s.cron.AddFunc("@every 30s", func() {
-		if s.xrayService.IsNeedRestartAndSetFalse() {
-			err := s.xrayService.RestartXray(false)
-			if err != nil {
-				logger.Error("restart xray failed:", err)
-			}
-		}
-	})
-
-	go func() {
-		time.Sleep(time.Second * 5)
-		// Statistics every 10 seconds, start the delay for 5 seconds for the first time, and staggered with the time to restart xray
-		s.cron.AddJob("@every 10s", job.NewXrayTrafficJob())
-	}()
+	// Xray monitoring and sync jobs
+	s.cron.AddJob("@every 10s", job.NewXrayTrafficJob(s.xrayService))
+	s.cron.AddJob("@every 30s", job.NewXrayConfigSyncJob(s.xrayService))
 
 	// check client ips from log file every 10 sec
 	s.cron.AddJob("@every 10s", job.NewCheckClientIpJob())
@@ -438,10 +423,14 @@ func (s *Server) Start() (err error) {
 	return nil
 }
 
-// Stop gracefully shuts down the web server, stops Xray, cron jobs, and Telegram bot.
+// Stop gracefully shuts down the web server, cron jobs, and Telegram bot.
 func (s *Server) Stop() error {
 	s.cancel()
-	s.xrayService.StopXray()
+
+	if s.xrayService != nil {
+		s.xrayService.CloseConnection()
+	}
+
 	if s.cron != nil {
 		s.cron.Stop()
 	}

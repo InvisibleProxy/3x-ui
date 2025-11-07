@@ -10,43 +10,45 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-// XrayTrafficJob collects and processes traffic statistics from Xray, updating the database and optionally informing external APIs.
+// XrayTrafficJob collects and processes traffic statistics from Xray.
 type XrayTrafficJob struct {
 	settingService  service.SettingService
-	xrayService     service.XrayService
+	xrayService     *service.XrayService
 	inboundService  service.InboundService
 	outboundService service.OutboundService
 }
 
 // NewXrayTrafficJob creates a new traffic collection job instance.
-func NewXrayTrafficJob() *XrayTrafficJob {
-	return new(XrayTrafficJob)
+func NewXrayTrafficJob(xrayService *service.XrayService) *XrayTrafficJob {
+	return &XrayTrafficJob{
+		xrayService: xrayService,
+	}
 }
 
-// Run collects traffic statistics from Xray and updates the database, triggering restart if needed.
+// Run collects traffic statistics from Xray and updates the database.
 func (j *XrayTrafficJob) Run() {
-	if !j.xrayService.IsXrayRunning() {
-		return
-	}
 	traffics, clientTraffics, err := j.xrayService.GetXrayTraffic()
 	if err != nil {
 		return
 	}
-	err, needRestart0 := j.inboundService.AddTraffic(traffics, clientTraffics)
+
+	// Update inbound traffic in database
+	err, _ = j.inboundService.AddTraffic(traffics, clientTraffics)
 	if err != nil {
 		logger.Warning("add inbound traffic failed:", err)
 	}
-	err, needRestart1 := j.outboundService.AddTraffic(traffics, clientTraffics)
+
+	// Update outbound traffic in database
+	err, _ = j.outboundService.AddTraffic(traffics, clientTraffics)
 	if err != nil {
 		logger.Warning("add outbound traffic failed:", err)
 	}
-	if ExternalTrafficInformEnable, err := j.settingService.GetExternalTrafficInformEnable(); ExternalTrafficInformEnable {
+
+	// Send traffic to external API if enabled
+	if externalEnabled, err := j.settingService.GetExternalTrafficInformEnable(); externalEnabled {
 		j.informTrafficToExternalAPI(traffics, clientTraffics)
 	} else if err != nil {
 		logger.Warning("get ExternalTrafficInformEnable failed:", err)
-	}
-	if needRestart0 || needRestart1 {
-		j.xrayService.SetToNeedRestart()
 	}
 }
 

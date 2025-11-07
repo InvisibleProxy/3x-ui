@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/mhsanaei/3x-ui/v2/database/model"
+	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/web/service"
 	"github.com/mhsanaei/3x-ui/v2/web/session"
 
@@ -14,13 +15,17 @@ import (
 
 // InboundController handles HTTP requests related to Xray inbounds management.
 type InboundController struct {
-	inboundService service.InboundService
-	xrayService    service.XrayService
+	inboundService *service.InboundService
 }
 
 // NewInboundController creates a new InboundController and sets up its routes.
-func NewInboundController(g *gin.RouterGroup) *InboundController {
-	a := &InboundController{}
+func NewInboundController(g *gin.RouterGroup, xrayService *service.XrayService) *InboundController {
+	a := &InboundController{
+		inboundService: &service.InboundService{},
+	}
+	if xrayService != nil {
+		a.inboundService.SetXrayAPI(xrayService.GetXrayAPI())
+	}
 	a.initRouter(g)
 	return a
 }
@@ -117,14 +122,14 @@ func (a *InboundController) addInbound(c *gin.Context) {
 	}
 
 	inbound, needRestart, err := a.inboundService.AddInbound(inbound)
+	if needRestart {
+		logger.Warning("[ADD] Inbound saved to DB but not applied:", inbound.Tag)
+	}
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
 	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundCreateSuccess"), inbound, nil)
-	if needRestart {
-		a.xrayService.SetToNeedRestart()
-	}
 }
 
 // delInbound deletes an inbound configuration by its ID.
@@ -135,14 +140,14 @@ func (a *InboundController) delInbound(c *gin.Context) {
 		return
 	}
 	needRestart, err := a.inboundService.DelInbound(id)
+	if needRestart {
+		logger.Warning("[DELETE] Inbound deleted from DB but not removed:", id)
+	}
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
 	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundDeleteSuccess"), id, nil)
-	if needRestart {
-		a.xrayService.SetToNeedRestart()
-	}
 }
 
 // updateInbound updates an existing inbound configuration.
@@ -152,23 +157,24 @@ func (a *InboundController) updateInbound(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), err)
 		return
 	}
-	inbound := &model.Inbound{
-		Id: id,
-	}
+
+	inbound := &model.Inbound{Id: id}
 	err = c.ShouldBind(inbound)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), err)
 		return
 	}
+
 	inbound, needRestart, err := a.inboundService.UpdateInbound(inbound)
+	if needRestart {
+		logger.Warning("[UPDATE] Inbound updated in DB but not applied:", inbound.Tag)
+	}
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
+
 	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundUpdateSuccess"), inbound, nil)
-	if needRestart {
-		a.xrayService.SetToNeedRestart()
-	}
 }
 
 // getClientIps retrieves the IP addresses associated with a client by email.
@@ -206,14 +212,14 @@ func (a *InboundController) addInboundClient(c *gin.Context) {
 	}
 
 	needRestart, err := a.inboundService.AddInboundClient(data)
+	if needRestart {
+		logger.Warning("[ADD CLIENT] Saved to DB but not applied")
+	}
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundClientAddSuccess"), nil)
-	if needRestart {
-		a.xrayService.SetToNeedRestart()
-	}
 }
 
 // delInboundClient deletes a client from an inbound by inbound ID and client ID.
@@ -226,14 +232,14 @@ func (a *InboundController) delInboundClient(c *gin.Context) {
 	clientId := c.Param("clientId")
 
 	needRestart, err := a.inboundService.DelInboundClient(id, clientId)
+	if needRestart {
+		logger.Warning("[DELETE CLIENT] Deleted from DB but not removed:", clientId)
+	}
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundClientDeleteSuccess"), nil)
-	if needRestart {
-		a.xrayService.SetToNeedRestart()
-	}
 }
 
 // updateInboundClient updates a client's configuration in an inbound.
@@ -248,14 +254,14 @@ func (a *InboundController) updateInboundClient(c *gin.Context) {
 	}
 
 	needRestart, err := a.inboundService.UpdateInboundClient(inbound, clientId)
+	if needRestart {
+		logger.Warning("[UPDATE CLIENT] Updated in DB but not applied:", clientId)
+	}
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.inboundClientUpdateSuccess"), nil)
-	if needRestart {
-		a.xrayService.SetToNeedRestart()
-	}
 }
 
 // resetClientTraffic resets the traffic counter for a specific client in an inbound.
@@ -268,14 +274,14 @@ func (a *InboundController) resetClientTraffic(c *gin.Context) {
 	email := c.Param("email")
 
 	needRestart, err := a.inboundService.ResetClientTraffic(id, email)
+	if needRestart {
+		logger.Warning("[RESET TRAFFIC] Reset in DB but not applied:", email)
+	}
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.resetInboundClientTrafficSuccess"), nil)
-	if needRestart {
-		a.xrayService.SetToNeedRestart()
-	}
 }
 
 // resetAllTraffics resets all traffic counters across all inbounds.
@@ -284,8 +290,6 @@ func (a *InboundController) resetAllTraffics(c *gin.Context) {
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
-	} else {
-		a.xrayService.SetToNeedRestart()
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.resetAllTrafficSuccess"), nil)
 }
@@ -302,8 +306,6 @@ func (a *InboundController) resetAllClientTraffics(c *gin.Context) {
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
-	} else {
-		a.xrayService.SetToNeedRestart()
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.resetAllClientTrafficSuccess"), nil)
 }
@@ -332,10 +334,10 @@ func (a *InboundController) importInbound(c *gin.Context) {
 
 	needRestart := false
 	inbound, needRestart, err = a.inboundService.AddInbound(inbound)
-	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundCreateSuccess"), inbound, err)
-	if err == nil && needRestart {
-		a.xrayService.SetToNeedRestart()
+	if needRestart {
+		logger.Warning("[IMPORT] Inbound saved to DB but not applied:", inbound.Tag)
 	}
+	jsonMsgObj(c, I18nWeb(c, "pages.inbounds.toasts.inboundCreateSuccess"), inbound, err)
 }
 
 // delDepletedClients deletes clients in an inbound who have exhausted their traffic limits.
@@ -400,13 +402,12 @@ func (a *InboundController) delInboundClientByEmail(c *gin.Context) {
 
 	email := c.Param("email")
 	needRestart, err := a.inboundService.DelInboundClientByEmail(inboundId, email)
+	if needRestart {
+		logger.Warning("[DELETE CLIENT] Deleted from DB but not removed:", email)
+	}
 	if err != nil {
 		jsonMsg(c, "Failed to delete client by email", err)
 		return
 	}
-
 	jsonMsg(c, "Client deleted successfully", nil)
-	if needRestart {
-		a.xrayService.SetToNeedRestart()
-	}
 }

@@ -25,6 +25,7 @@ var xrayTemplateConfig string
 
 var defaultValueMap = map[string]string{
 	"xrayTemplateConfig":          xrayTemplateConfig,
+	"xrayEnabled":                 "true",
 	"webListen":                   "",
 	"webDomain":                   "",
 	"webPort":                     "2053",
@@ -264,6 +265,14 @@ func (s *SettingService) setInt(key string, value int) error {
 
 func (s *SettingService) GetXrayConfigTemplate() (string, error) {
 	return s.getString("xrayTemplateConfig")
+}
+
+func (s *SettingService) GetXrayEnabled() (bool, error) {
+	return s.getBool("xrayEnabled")
+}
+
+func (s *SettingService) SetXrayEnabled(enabled bool) error {
+	return s.setBool("xrayEnabled", enabled)
 }
 
 func (s *SettingService) GetListen() (string, error) {

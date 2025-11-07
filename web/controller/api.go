@@ -14,12 +14,15 @@ type APIController struct {
 	BaseController
 	inboundController *InboundController
 	serverController  *ServerController
+	xrayService       *service.XrayService
 	Tgbot             service.Tgbot
 }
 
 // NewAPIController creates a new APIController instance and initializes its routes.
-func NewAPIController(g *gin.RouterGroup) *APIController {
-	a := &APIController{}
+func NewAPIController(g *gin.RouterGroup, xrayService *service.XrayService) *APIController {
+	a := &APIController{
+		xrayService: xrayService,
+	}
 	a.initRouter(g)
 	return a
 }
@@ -42,11 +45,11 @@ func (a *APIController) initRouter(g *gin.RouterGroup) {
 
 	// Inbounds API
 	inbounds := api.Group("/inbounds")
-	a.inboundController = NewInboundController(inbounds)
+	a.inboundController = NewInboundController(inbounds, a.xrayService)
 
 	// Server API
 	server := api.Group("/server")
-	a.serverController = NewServerController(server)
+	a.serverController = NewServerController(server, a.xrayService)
 
 	// Extra routes
 	api.GET("/backuptotgbot", a.BackuptoTgbot)

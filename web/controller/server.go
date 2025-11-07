@@ -29,8 +29,11 @@ type ServerController struct {
 }
 
 // NewServerController creates a new ServerController, initializes routes, and starts background tasks.
-func NewServerController(g *gin.RouterGroup) *ServerController {
+func NewServerController(g *gin.RouterGroup, xrayService *service.XrayService) *ServerController {
 	a := &ServerController{}
+
+	a.serverService.InitWithXrayService(xrayService)
+
 	a.initRouter(g)
 	a.startTask()
 	return a

@@ -20,7 +20,6 @@ var DefaultTruthyValues = []string{"true", "1", "yes", "on"}
 type LdapSyncJob struct {
 	settingService service.SettingService
 	inboundService service.InboundService
-	xrayService    service.XrayService
 }
 
 // --- Helper functions for mustGet ---
@@ -146,7 +145,6 @@ func (j *LdapSyncJob) Run() {
 			logger.Warningf("Failed to add clients for tag %s: %v", tag, err)
 		} else {
 			logger.Infof("LDAP auto-create: %d clients for %s", len(newClients), tag)
-			j.xrayService.SetToNeedRestart()
 		}
 	}
 
@@ -233,7 +231,6 @@ func (j *LdapSyncJob) batchSetEnable(ib *model.Inbound, emails []string, enable 
 	}
 
 	logger.Infof("Batch set enable=%v for %d clients in inbound %s", enable, len(emails), ib.Tag)
-	j.xrayService.SetToNeedRestart()
 }
 
 // deleteClientsNotInLDAP deletes clients not in LDAP using batches and a single restart
@@ -301,10 +298,8 @@ func (j *LdapSyncJob) deleteClientsNotInLDAP(inboundTag string, ldapEmails map[s
 		}
 	}
 
-	// One time after all batches
 	if restartNeeded {
-		j.xrayService.SetToNeedRestart()
-		logger.Info("Xray restart scheduled after batch deletion")
+		logger.Debug("LDAP sync: batch deletion completed")
 	}
 }
 
@@ -377,7 +372,6 @@ func (j *LdapSyncJob) ensureClientExists(inboundTag string, email string, defGB 
 	if _, err := j.inboundService.AddInboundClient(payload); err != nil {
 		logger.Warning("ensureClientExists: add client failed:", err)
 	} else {
-		j.xrayService.SetToNeedRestart()
 		logger.Infof("LDAP auto-create: %s in %s", email, inboundTag)
 	}
 }

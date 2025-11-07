@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -115,6 +116,14 @@ type ServerService struct {
 	cpuHistory         []CPUSample
 	cachedCpuSpeedMhz  float64
 	lastCpuInfoAttempt time.Time
+}
+
+// InitWithXrayService initializes the ServerService with XrayService.
+func (s *ServerService) InitWithXrayService(xrayService *XrayService) {
+	if xrayService != nil {
+		s.xrayService = *xrayService
+		s.inboundService.SetXrayAPI(xrayService.GetXrayAPI())
+	}
 }
 
 // AggregateCpuHistory returns up to maxPoints averaged buckets of size bucketSeconds over recent data.
@@ -393,13 +402,8 @@ func (s *ServerService) GetStatus(lastStatus *Status) *Status {
 		status.Xray.State = Running
 		status.Xray.ErrorMsg = ""
 	} else {
-		err := s.xrayService.GetXrayErr()
-		if err != nil {
-			status.Xray.State = Error
-		} else {
-			status.Xray.State = Stop
-		}
-		status.Xray.ErrorMsg = s.xrayService.GetXrayResult()
+		status.Xray.State = Error
+		status.Xray.ErrorMsg = "Xray container is not accessible"
 	}
 	status.Xray.Version = s.xrayService.GetXrayVersion()
 
@@ -408,11 +412,11 @@ func (s *ServerService) GetStatus(lastStatus *Status) *Status {
 	runtime.ReadMemStats(&rtm)
 	status.AppStats.Mem = rtm.Sys
 	status.AppStats.Threads = uint32(runtime.NumGoroutine())
-	if p != nil && p.IsRunning() {
-		status.AppStats.Uptime = p.GetUptime()
-	} else {
-		status.AppStats.Uptime = 0
-	}
+
+	// @FIXME: do something with it. I won't remove it for now, but it's not used.
+	//		   in docker environment, uptime is tracked by docker itself, but in host environment,
+	//		   we need to track it ourselves. I will leave it here for now.
+	status.AppStats.Uptime = 0
 
 	return status
 }
@@ -562,21 +566,98 @@ func (s *ServerService) GetXrayVersions() ([]string, error) {
 	return versions, nil
 }
 
+// StopXrayService stops Xray by removing all inbounds.
 func (s *ServerService) StopXrayService() error {
-	err := s.xrayService.StopXray()
+	settingService := SettingService{}
+	err := settingService.SetXrayEnabled(false)
 	if err != nil {
-		logger.Error("stop xray failed:", err)
-		return err
+		logger.Error("[STOP] Database error:", err)
+		return errors.New("unable to stop service: database is unavailable")
 	}
+
+	xrayAPI := s.xrayService.GetXrayAPI()
+	if xrayAPI == nil {
+		logger.Info("[STOP] Service stopped")
+		return nil
+	}
+
+	currentTags, err := xrayAPI.ListInboundTags()
+	if err != nil {
+		logger.Info("[STOP] Service stopped")
+		return nil
+	}
+
+	removedCount := 0
+	for _, tag := range currentTags {
+		if tag == "api" {
+			continue
+		}
+		if xrayAPI.DelInbound(tag) == nil {
+			removedCount++
+		}
+	}
+
+	logger.Info("[STOP] Service stopped, removed", removedCount, "inbounds")
 	return nil
 }
 
+// RestartXrayService resynchronizes all inbounds with Xray.
 func (s *ServerService) RestartXrayService() error {
-	err := s.xrayService.RestartXray(true)
+	settingService := SettingService{}
+	err := settingService.SetXrayEnabled(true)
 	if err != nil {
-		logger.Error("start xray failed:", err)
-		return err
+		logger.Error("[RESTART] Database error:", err)
+		return errors.New("unable to restart service: database is unavailable")
 	}
+
+	xrayAPI := s.xrayService.GetXrayAPI()
+	if xrayAPI == nil {
+		logger.Warning("[RESTART] Xray unavailable, will auto-sync when ready")
+		return errors.New("xray is not available, configuration will be restored automatically")
+	}
+
+	// Remove all current inbounds
+	currentTags, _ := xrayAPI.ListInboundTags()
+	removedCount := 0
+	for _, tag := range currentTags {
+		if tag != "api" && xrayAPI.DelInbound(tag) == nil {
+			removedCount++
+		}
+	}
+
+	// Add all enabled inbounds from DB
+	allInbounds, err := s.inboundService.GetAllInbounds()
+	if err != nil {
+		logger.Error("[RESTART] Database error:", err)
+		return fmt.Errorf("unable to load configuration from database: %w", err)
+	}
+
+	addedCount := 0
+	failedCount := 0
+	for _, inbound := range allInbounds {
+		if !inbound.Enable {
+			continue
+		}
+
+		inboundJson, err := json.MarshalIndent(inbound.GenXrayInboundConfig(), "", "  ")
+		if err != nil {
+			failedCount++
+			continue
+		}
+
+		if xrayAPI.AddInbound(inboundJson) == nil {
+			addedCount++
+		} else {
+			logger.Warning("[RESTART] Failed to add", inbound.Tag)
+			failedCount++
+		}
+	}
+
+	if failedCount > 0 {
+		return fmt.Errorf("restart partially failed: %d inbound(s) could not be added", failedCount)
+	}
+
+	logger.Info("[RESTART] Complete: removed", removedCount, ", added", addedCount)
 	return nil
 }
 
@@ -684,17 +765,12 @@ func (s *ServerService) UpdateXray(version string) error {
 	} else {
 		err = copyZipFile("xray", xray.GetBinaryPath())
 	}
+
 	if err != nil {
 		return err
 	}
 
-	// 5. Restart xray
-	if err := s.xrayService.RestartXray(true); err != nil {
-		logger.Error("start xray failed:", err)
-		return err
-	}
-
-	return nil
+	return err
 }
 
 func (s *ServerService) GetLogs(count string, level string, syslog string) []string {

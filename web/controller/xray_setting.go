@@ -71,7 +71,8 @@ func (a *XraySettingController) getDefaultXrayConfig(c *gin.Context) {
 
 // getXrayResult retrieves the current Xray service result.
 func (a *XraySettingController) getXrayResult(c *gin.Context) {
-	jsonObj(c, a.XrayService.GetXrayResult(), nil)
+	// Return empty string for backward compatibility
+	jsonObj(c, "", nil)
 }
 
 // warp handles Warp-related operations based on the action parameter.

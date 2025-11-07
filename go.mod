@@ -20,7 +20,6 @@ require (
 	github.com/valyala/fasthttp v1.67.0
 	github.com/xlzd/gotp v0.1.0
 	github.com/xtls/xray-core v1.250911.1-0.20251015080723-b69a376aa1b6
-	go.uber.org/atomic v1.11.0
 	golang.org/x/crypto v0.43.0
 	golang.org/x/sys v0.37.0
 	golang.org/x/text v0.30.0
@@ -75,7 +74,7 @@ require (
 	github.com/riobard/go-bloom v0.0.0-20200614022211-cdc8013cb5b3 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/sagernet/sing v0.7.12 // indirect
-	github.com/sagernet/sing-shadowsocks v0.2.9 // indirect
+	github.com/sagernet/sing-shadowsocks v0.2.7 // indirect
 	github.com/seiflotfy/cuckoofilter v0.0.0-20240715131351-a2f2c23f1771 // indirect
 	github.com/tklauser/go-sysconf v0.3.15 // indirect
 	github.com/tklauser/numcpus v0.10.0 // indirect
