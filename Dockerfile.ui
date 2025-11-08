@@ -1,0 +1,82 @@
+FROM golang:1.25-alpine AS builder
+
+ARG TARGETPLATFORM
+ARG XRAY_VERSION=25.10.15
+ENV TZ=Asia/Tehran
+ENV XRAY_CORE_VERSION=${XRAY_VERSION}
+
+RUN apk --no-cache --update add \
+  build-base \
+  gcc \
+  git
+
+ENV CGO_ENABLED=1
+ENV CGO_CFLAGS="-D_LARGEFILE64_SOURCE"
+ENV GOPROXY=https://goproxy.io,https://goproxy.cn,https://mirrors.aliyun.com/goproxy/,direct
+ENV GOSUMDB=off
+ENV GOPRIVATE=*
+
+WORKDIR /tmp/xray
+
+# Download Xray Core binary using script
+COPY xray.sh /tmp/xray/xray.sh
+RUN sed -i 's/\r$//' /tmp/xray/xray.sh \
+    && chmod +x /tmp/xray/xray.sh \
+    && /tmp/xray/xray.sh "${TARGETPLATFORM}" "${XRAY_VERSION}"
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN go build -ldflags "-w -s" -o build/x-ui main.go
+
+# ========================================================
+
+FROM alpine:3.19 AS runtime
+LABEL maintainer="3x-ui"
+LABEL description="3x-ui web interface and API server"
+
+ENV TZ=Asia/Tehran
+ARG XRAY_VERSION=25.10.15
+ENV XRAY_CORE_VERSION=${XRAY_VERSION}
+
+WORKDIR /app
+
+RUN apk add --no-cache --update \
+  ca-certificates \
+  tzdata \
+  fail2ban \
+  bash \
+  wget && \
+  rm -rf /var/cache/apk/*
+
+# Create bin directory for xray binaries and config
+RUN mkdir -p /app/bin && echo '{}' > /app/bin/config.json
+
+COPY --from=builder /app/build/x-ui /app/
+COPY --from=builder /app/x-ui.sh /usr/bin/x-ui
+COPY --from=builder /usr/bin/xray /usr/bin/xray
+
+# Configure fail2ban
+RUN rm -f /etc/fail2ban/jail.d/alpine-ssh.conf \
+  && cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local \
+  && sed -i "s/^\[ssh\]$/&\nenabled = false/" /etc/fail2ban/jail.local \
+  && sed -i "s/^\[sshd\]$/&\nenabled = false/" /etc/fail2ban/jail.local \
+  && sed -i "s/#allowipv6 = auto/allowipv6 = auto/g" /etc/fail2ban/fail2ban.conf
+
+# Create startup script inline
+RUN echo '#!/bin/sh' > /app/start.sh && \
+    echo '[ "$XUI_ENABLE_FAIL2BAN" = "true" ] && fail2ban-client -x start' >> /app/start.sh && \
+    echo 'exec /app/x-ui' >> /app/start.sh && \
+    chmod +x /app/start.sh /app/x-ui /usr/bin/x-ui
+
+ENV XUI_ENABLE_FAIL2BAN="true"
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=40s \
+  CMD wget --quiet --tries=1 --spider http://localhost:2053 || exit 1
+
+EXPOSE 2053
+VOLUME [ "/etc/x-ui" ]
+ENTRYPOINT [ "/app/start.sh" ]
