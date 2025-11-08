@@ -24,13 +24,11 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// Magic values
 const (
 	apiInboundTag = "api"
 )
 
 // XrayAPI is a gRPC client for managing Xray core.
-// Thread-safe - can be used concurrently.
 type XrayAPI struct {
 	HandlerServiceClient command.HandlerServiceClient
 	StatsServiceClient   statsService.StatsServiceClient
@@ -196,6 +194,44 @@ func (x *XrayAPI) RemoveUser(inboundTag, email string) error {
 	return nil
 }
 
+// AddOutbound adds a new outbound configuration to Xray.
+func (x *XrayAPI) AddOutbound(outbound []byte) error {
+	logger.Debug("[ADD OUTBOUND] JSON:", string(outbound))
+
+	conf := new(conf.OutboundDetourConfig)
+	if err := json.Unmarshal(outbound, conf); err != nil {
+		return fmt.Errorf("invalid outbound configuration: %w", err)
+	}
+
+	config, err := conf.Build()
+	if err != nil {
+		return fmt.Errorf("failed to build outbound: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = x.HandlerServiceClient.AddOutbound(ctx, &command.AddOutboundRequest{Outbound: config})
+	if err != nil {
+		return fmt.Errorf("failed to add outbound: %w", err)
+	}
+
+	logger.Debug("[ADD OUTBOUND] Success:", conf.Tag)
+	return nil
+}
+
+// DelOutbound removes an outbound by tag.
+func (x *XrayAPI) DelOutbound(tag string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := x.HandlerServiceClient.RemoveOutbound(ctx, &command.RemoveOutboundRequest{Tag: tag})
+	if err != nil {
+		return fmt.Errorf("failed to remove outbound: %w", err)
+	}
+	return nil
+}
+
 // ListInboundTags returns all currently running inbound tags.
 func (x *XrayAPI) ListInboundTags() ([]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -211,6 +247,27 @@ func (x *XrayAPI) ListInboundTags() ([]string, error) {
 		for _, inbound := range resp.Inbounds {
 			if inbound != nil && inbound.Tag != "" {
 				tags = append(tags, inbound.Tag)
+			}
+		}
+	}
+	return tags, nil
+}
+
+// ListOutboundTags returns all currently running outbound tags.
+func (x *XrayAPI) ListOutboundTags() ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := x.HandlerServiceClient.ListOutbounds(ctx, &command.ListOutboundsRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get outbound list: %w", err)
+	}
+
+	var tags []string
+	if resp != nil && resp.Outbounds != nil {
+		for _, outbound := range resp.Outbounds {
+			if outbound != nil && outbound.Tag != "" {
+				tags = append(tags, outbound.Tag)
 			}
 		}
 	}

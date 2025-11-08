@@ -264,7 +264,68 @@ func (s *SettingService) setInt(key string, value int) error {
 }
 
 func (s *SettingService) GetXrayConfigTemplate() (string, error) {
-	return s.getString("xrayTemplateConfig")
+	template, err := s.buildXrayConfigFromSections()
+	if err != nil {
+		return "", common.NewError("failed to build xray config from sections:", err)
+	}
+
+	if template == "" {
+		return "", common.NewError("xray template not found in database")
+	}
+
+	return template, nil
+}
+
+// buildXrayConfigFromSections builds Xray config template from individual sections in DB
+func (s *SettingService) buildXrayConfigFromSections() (string, error) {
+	db := database.GetDB()
+
+	templateData, err := database.GetJSON(db, model.KeyXrayTemplate)
+	if err != nil {
+		return "", err
+	}
+
+	var config map[string]any
+	if err := json.Unmarshal(templateData, &config); err != nil {
+		return "", err
+	}
+
+	sectionMap := map[string]string{
+		model.KeyLog:         "log",
+		model.KeyAPI:         "api",
+		model.KeyPolicy:      "policy",
+		model.KeyRouting:     "routing",
+		model.KeyStats:       "stats",
+		model.KeyMetrics:     "metrics",
+		model.KeyTransport:   "transport",
+		model.KeyDNS:         "dns",
+		model.KeyReverse:     "reverse",
+		model.KeyFakeDNS:     "fakedns",
+		model.KeyObservatory: "observatory",
+		model.KeyBurstObserv: "burstObservatory",
+	}
+
+	for dbKey, jsonKey := range sectionMap {
+		sectionData, err := database.GetJSON(db, dbKey)
+		if err != nil {
+			continue
+		}
+
+		var section any
+		if err := json.Unmarshal(sectionData, &section); err != nil {
+			logger.Warning("Failed to parse section", dbKey, ":", err)
+			continue
+		}
+
+		config[jsonKey] = section
+	}
+
+	result, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", err
+	}
+
+	return string(result), nil
 }
 
 func (s *SettingService) GetXrayEnabled() (bool, error) {

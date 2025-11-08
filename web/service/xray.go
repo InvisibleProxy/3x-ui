@@ -3,10 +3,14 @@ package service
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 
+	"github.com/mhsanaei/3x-ui/v2/database"
+	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/logger"
+	"github.com/mhsanaei/3x-ui/v2/util/json_util"
 	"github.com/mhsanaei/3x-ui/v2/xray"
 )
 
@@ -105,12 +109,30 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		return nil, err
 	}
 
+	inboundConfigs, err := s.buildInboundsConfig()
+	if err != nil {
+		return nil, err
+	}
+	xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, inboundConfigs...)
+
+	outboundConfigs, err := s.buildOutboundsConfig()
+	if err == nil {
+		xrayConfig.OutboundConfigs = append(xrayConfig.OutboundConfigs, outboundConfigs...)
+	}
+
+	return xrayConfig, nil
+}
+
+// buildInboundsConfig builds inbound configurations from DB with client filtering and cleanup.
+func (s *XrayService) buildInboundsConfig() ([]xray.InboundConfig, error) {
 	s.inboundService.AddTraffic(nil, nil)
 
 	inbounds, err := s.inboundService.GetAllInbounds()
 	if err != nil {
 		return nil, err
 	}
+
+	var inboundConfigs []xray.InboundConfig
 	for _, inbound := range inbounds {
 		if !inbound.Enable {
 			continue
@@ -161,16 +183,15 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 			if err != nil {
 				return nil, err
 			}
-
 			inbound.Settings = string(modifiedSettings)
 		}
 
+		// Process stream settings
 		if len(inbound.StreamSettings) > 0 {
-			// Unmarshal stream JSON
 			var stream map[string]any
 			json.Unmarshal([]byte(inbound.StreamSettings), &stream)
 
-			// Remove the "settings" field under "tlsSettings" and "realitySettings"
+			// Remove sensitive fields
 			tlsSettings, ok1 := stream["tlsSettings"].(map[string]any)
 			realitySettings, ok2 := stream["realitySettings"].(map[string]any)
 			if ok1 || ok2 {
@@ -180,7 +201,6 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 					delete(realitySettings, "settings")
 				}
 			}
-
 			delete(stream, "externalProxy")
 
 			newStream, err := json.MarshalIndent(stream, "", "  ")
@@ -191,9 +211,37 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		}
 
 		inboundConfig := inbound.GenXrayInboundConfig()
-		xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *inboundConfig)
+		inboundConfigs = append(inboundConfigs, *inboundConfig)
 	}
-	return xrayConfig, nil
+
+	return inboundConfigs, nil
+}
+
+// buildOutboundsConfig builds outbound configurations from DB.
+func (s *XrayService) buildOutboundsConfig() ([]xray.OutboundConfig, error) {
+	outboundService := OutboundService{}
+	outbounds, err := outboundService.GetAllOutbounds()
+	if err != nil {
+		return nil, err
+	}
+
+	var outboundConfigs []xray.OutboundConfig
+	for _, outbound := range outbounds {
+		if !outbound.Enable {
+			continue
+		}
+		outboundConfig := xray.OutboundConfig{
+			Tag:            outbound.Tag,
+			Protocol:       outbound.Protocol,
+			Settings:       json_util.RawMessage(outbound.Settings),
+			StreamSettings: json_util.RawMessage(outbound.StreamSettings),
+			ProxySettings:  json_util.RawMessage(outbound.ProxySettings),
+			Mux:            json_util.RawMessage(outbound.Mux),
+		}
+		outboundConfigs = append(outboundConfigs, outboundConfig)
+	}
+
+	return outboundConfigs, nil
 }
 
 // GetXrayTraffic retrieves traffic statistics.
@@ -215,4 +263,259 @@ func (s *XrayService) CloseConnection() {
 	if s.xrayAPI != nil {
 		s.xrayAPI.Close()
 	}
+}
+
+// GetVirtualConfig builds virtual config.json from DB (template + all inbounds + all outbounds).
+func (s *XrayService) GetVirtualConfig() (string, error) {
+	config, err := s.GetXrayConfig()
+	if err != nil {
+		return "", err
+	}
+
+	configBytes, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", err
+	}
+
+	return string(configBytes), nil
+}
+
+// GetVirtualConfigJSON builds virtual config and returns as map.
+func (s *XrayService) GetVirtualConfigJSON() (any, error) {
+	config, err := s.GetXrayConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	configBytes, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+
+	var jsonData any
+	err = json.Unmarshal(configBytes, &jsonData)
+	if err != nil {
+		return nil, err
+	}
+
+	return jsonData, nil
+}
+
+// GetFullXrayConfigFromDB builds complete Xray config from DB sections, inbounds and outbounds.
+// This returns the full representation of what's stored in the database.
+func (s *XrayService) GetFullXrayConfigFromDB() (any, error) {
+	config, err := s.GetXrayConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	configBytes, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+
+	var jsonData any
+	err = json.Unmarshal(configBytes, &jsonData)
+	if err != nil {
+		return nil, err
+	}
+
+	return jsonData, nil
+}
+
+// ApplyVirtualConfig parses and saves Xray configuration to database.
+func (s *XrayService) ApplyVirtualConfig(newConfigStr string) error {
+	newConfig := &xray.Config{}
+	err := json.Unmarshal([]byte(newConfigStr), newConfig)
+	if err != nil {
+		return fmt.Errorf("failed to parse configuration: %w", err)
+	}
+
+	templateConfig := &xray.Config{
+		LogConfig:        newConfig.LogConfig,
+		API:              newConfig.API,
+		DNSConfig:        newConfig.DNSConfig,
+		RouterConfig:     newConfig.RouterConfig,
+		Policy:           newConfig.Policy,
+		InboundConfigs:   []xray.InboundConfig{},
+		OutboundConfigs:  []xray.OutboundConfig{},
+		Transport:        newConfig.Transport,
+		Stats:            newConfig.Stats,
+		Reverse:          newConfig.Reverse,
+		FakeDNS:          newConfig.FakeDNS,
+		Observatory:      newConfig.Observatory,
+		BurstObservatory: newConfig.BurstObservatory,
+		Metrics:          newConfig.Metrics,
+	}
+
+	for _, inbound := range newConfig.InboundConfigs {
+		if inbound.Tag == "api" {
+			templateConfig.InboundConfigs = append(templateConfig.InboundConfigs, inbound)
+			break
+		}
+	}
+
+	err = s.SaveXrayConfigSections(templateConfig)
+	if err != nil {
+		return err
+	}
+
+	err = s.syncInboundsFromVirtualConfig(newConfig.InboundConfigs)
+	if err != nil {
+		return err
+	}
+
+	if len(newConfig.OutboundConfigs) > 0 {
+		if err := s.syncOutboundsFromVirtualConfig(newConfig.OutboundConfigs); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// SaveXrayConfigSections saves Xray configuration as separate sections in DB atomically.
+func (s *XrayService) SaveXrayConfigSections(config *xray.Config) error {
+	db := database.GetDB()
+
+	templateBytes, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	sectionsMap := map[string]json_util.RawMessage{
+		model.KeyXrayTemplate: json_util.RawMessage(templateBytes),
+		model.KeyLog:          config.LogConfig,
+		model.KeyAPI:          config.API,
+		model.KeyPolicy:       config.Policy,
+		model.KeyRouting:      config.RouterConfig,
+		model.KeyStats:        config.Stats,
+		model.KeyMetrics:      config.Metrics,
+		model.KeyTransport:    config.Transport,
+		model.KeyDNS:          config.DNSConfig,
+		model.KeyReverse:      config.Reverse,
+		model.KeyFakeDNS:      config.FakeDNS,
+		model.KeyObservatory:  config.Observatory,
+		model.KeyBurstObserv:  config.BurstObservatory,
+	}
+
+	tx := db.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	if err := tx.Error; err != nil {
+		return err
+	}
+
+	for key, value := range sectionsMap {
+		var sectionData []byte
+		if len(value) > 0 {
+			sectionData = []byte(value)
+		} else {
+			sectionData = []byte("null")
+		}
+
+		if err := database.SetJSON(tx, key, sectionData); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	return tx.Commit().Error
+}
+
+// syncInboundsFromVirtualConfig synchronizes inbounds from virtual config to DB.
+func (s *XrayService) syncInboundsFromVirtualConfig(configInbounds []xray.InboundConfig) error {
+	dbInbounds, err := s.inboundService.GetAllInbounds()
+	if err != nil {
+		return err
+	}
+
+	dbInboundMap := make(map[string]*model.Inbound)
+	for _, inbound := range dbInbounds {
+		dbInboundMap[inbound.Tag] = inbound
+	}
+
+	configInboundMap := make(map[string]bool)
+	for _, inbound := range configInbounds {
+		if inbound.Tag != "api" {
+			configInboundMap[inbound.Tag] = true
+		}
+	}
+
+	for tag, dbInbound := range dbInboundMap {
+		if !configInboundMap[tag] {
+			_, err := s.inboundService.DelInbound(dbInbound.Id)
+			if err != nil {
+				logger.Warning("Failed to delete inbound:", tag, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// syncOutboundsFromVirtualConfig synchronizes outbounds from virtual config to DB.
+func (s *XrayService) syncOutboundsFromVirtualConfig(configOutbounds []xray.OutboundConfig) error {
+	outboundService := OutboundService{}
+	outboundService.SetXrayAPI(s.xrayAPI)
+
+	dbOutbounds, err := outboundService.GetAllOutbounds()
+	if err != nil {
+		return err
+	}
+
+	dbOutboundMap := make(map[string]*model.Outbound)
+	for _, outbound := range dbOutbounds {
+		dbOutboundMap[outbound.Tag] = outbound
+	}
+
+	configOutboundMap := make(map[string]xray.OutboundConfig)
+	for _, outbound := range configOutbounds {
+		configOutboundMap[outbound.Tag] = outbound
+	}
+
+	// Delete outbounds removed from config
+	for tag, dbOutbound := range dbOutboundMap {
+		if _, exists := configOutboundMap[tag]; !exists {
+			err := outboundService.DelOutbound(dbOutbound.ID)
+			if err != nil {
+				logger.Warning("Failed to delete outbound:", tag, err)
+			}
+		}
+	}
+
+	// Add or update outbounds
+	for tag, configOutbound := range configOutboundMap {
+		if dbOutbound, exists := dbOutboundMap[tag]; exists {
+			dbOutbound.Protocol = configOutbound.Protocol
+			dbOutbound.Settings = string(configOutbound.Settings)
+			dbOutbound.StreamSettings = string(configOutbound.StreamSettings)
+			dbOutbound.ProxySettings = string(configOutbound.ProxySettings)
+			dbOutbound.Mux = string(configOutbound.Mux)
+			_, err := outboundService.UpdateOutbound(dbOutbound)
+			if err != nil {
+				logger.Warning("Failed to update outbound:", tag, err)
+			}
+		} else {
+			newOutbound := &model.Outbound{
+				Tag:            tag,
+				Protocol:       configOutbound.Protocol,
+				Settings:       string(configOutbound.Settings),
+				StreamSettings: string(configOutbound.StreamSettings),
+				ProxySettings:  string(configOutbound.ProxySettings),
+				Mux:            string(configOutbound.Mux),
+				Enable:         true,
+			}
+			_, err := outboundService.AddOutbound(newOutbound)
+			if err != nil {
+				logger.Warning("Failed to add outbound:", tag, err)
+			}
+		}
+	}
+
+	return nil
 }

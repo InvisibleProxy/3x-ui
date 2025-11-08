@@ -1,7 +1,6 @@
 package service
 
 import (
-	_ "embed"
 	"encoding/json"
 
 	"github.com/mhsanaei/3x-ui/v2/util/common"
@@ -15,10 +14,13 @@ type XraySettingService struct {
 }
 
 func (s *XraySettingService) SaveXraySetting(newXraySettings string) error {
-	if err := s.CheckXrayConfig(newXraySettings); err != nil {
-		return err
+	xrayConfig := &xray.Config{}
+	if err := json.Unmarshal([]byte(newXraySettings), xrayConfig); err != nil {
+		return common.NewError("xray template config invalid:", err)
 	}
-	return s.SettingService.saveSetting("xrayTemplateConfig", newXraySettings)
+
+	xrayService := XrayService{}
+	return xrayService.SaveXrayConfigSections(xrayConfig)
 }
 
 func (s *XraySettingService) CheckXrayConfig(XrayTemplateConfig string) error {

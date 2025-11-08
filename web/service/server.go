@@ -601,7 +601,7 @@ func (s *ServerService) StopXrayService() error {
 	return nil
 }
 
-// RestartXrayService resynchronizes all inbounds with Xray.
+// RestartXrayService resynchronizes all inbounds and outbounds with Xray.
 func (s *ServerService) RestartXrayService() error {
 	settingService := SettingService{}
 	err := settingService.SetXrayEnabled(true)
@@ -617,19 +617,41 @@ func (s *ServerService) RestartXrayService() error {
 	}
 
 	// Remove all current inbounds
-	currentTags, _ := xrayAPI.ListInboundTags()
-	removedCount := 0
-	for _, tag := range currentTags {
+	currentInboundTags, _ := xrayAPI.ListInboundTags()
+	removedInbounds := 0
+	for _, tag := range currentInboundTags {
 		if tag != "api" && xrayAPI.DelInbound(tag) == nil {
-			removedCount++
+			removedInbounds++
 		}
 	}
 
-	// Add all enabled inbounds from DB
+	// Remove all current outbounds
+	currentOutboundTags, _ := xrayAPI.ListOutboundTags()
+	removedOutbounds := 0
+	for _, tag := range currentOutboundTags {
+		if xrayAPI.DelOutbound(tag) == nil {
+			removedOutbounds++
+		}
+	}
+
+	addedInbounds, failedInbounds := s.restartInbounds(xrayAPI)
+	addedOutbounds, failedOutbounds := s.restartOutbounds(xrayAPI)
+
+	if failedInbounds > 0 || failedOutbounds > 0 {
+		return fmt.Errorf("restart partially failed: %d inbound(s) and %d outbound(s) could not be added",
+			failedInbounds, failedOutbounds)
+	}
+
+	logger.Info("[RESTART] Complete: removed", removedInbounds, "inbound(s) and", removedOutbounds, "outbound(s), added", addedInbounds, "inbound(s) and", addedOutbounds, "outbound(s)")
+	return nil
+}
+
+// restartInbounds adds all enabled inbounds from DB to Xray.
+func (s *ServerService) restartInbounds(xrayAPI *xray.XrayAPI) (int, int) {
 	allInbounds, err := s.inboundService.GetAllInbounds()
 	if err != nil {
-		logger.Error("[RESTART] Database error:", err)
-		return fmt.Errorf("unable to load configuration from database: %w", err)
+		logger.Error("[RESTART] Failed to load inbounds:", err)
+		return 0, 0
 	}
 
 	addedCount := 0
@@ -648,17 +670,48 @@ func (s *ServerService) RestartXrayService() error {
 		if xrayAPI.AddInbound(inboundJson) == nil {
 			addedCount++
 		} else {
-			logger.Warning("[RESTART] Failed to add", inbound.Tag)
+			logger.Warning("[RESTART] Failed to add inbound", inbound.Tag)
 			failedCount++
 		}
 	}
 
-	if failedCount > 0 {
-		return fmt.Errorf("restart partially failed: %d inbound(s) could not be added", failedCount)
+	return addedCount, failedCount
+}
+
+// restartOutbounds adds all enabled outbounds from DB to Xray.
+func (s *ServerService) restartOutbounds(xrayAPI *xray.XrayAPI) (int, int) {
+	outboundService := OutboundService{}
+	outboundService.SetXrayAPI(xrayAPI)
+
+	allOutbounds, err := outboundService.GetAllOutbounds()
+	if err != nil {
+		logger.Warning("[RESTART] Failed to load outbounds:", err)
+		return 0, 0
 	}
 
-	logger.Info("[RESTART] Complete: removed", removedCount, ", added", addedCount)
-	return nil
+	addedCount := 0
+	failedCount := 0
+	for _, outbound := range allOutbounds {
+		if !outbound.Enable {
+			continue
+		}
+
+		outboundJson, err := json.MarshalIndent(outbound.GenXrayOutboundConfig(), "", "  ")
+		if err != nil {
+			logger.Warning("[RESTART] Failed to marshal outbound", outbound.Tag, ":", err)
+			failedCount++
+			continue
+		}
+
+		if err := xrayAPI.AddOutbound(outboundJson); err != nil {
+			logger.Warning("[RESTART] Failed to add outbound", outbound.Tag, ":", err)
+			failedCount++
+		} else {
+			addedCount++
+		}
+	}
+
+	return addedCount, failedCount
 }
 
 func (s *ServerService) downloadXRay(version string) (string, error) {
@@ -927,22 +980,7 @@ func logEntryContains(line string, suffixes []string) bool {
 }
 
 func (s *ServerService) GetConfigJson() (any, error) {
-	config, err := s.xrayService.GetXrayConfig()
-	if err != nil {
-		return nil, err
-	}
-	contents, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-
-	var jsonData any
-	err = json.Unmarshal(contents, &jsonData)
-	if err != nil {
-		return nil, err
-	}
-
-	return jsonData, nil
+	return s.xrayService.GetVirtualConfigJSON()
 }
 
 func (s *ServerService) GetDb() ([]byte, error) {

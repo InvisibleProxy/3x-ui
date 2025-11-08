@@ -55,13 +55,27 @@ type Inbound struct {
 	Sniffing       string   `json:"sniffing" form:"sniffing"`
 }
 
+// Outbound represents an Xray outbound configuration.
+type Outbound struct {
+	ID             int    `json:"id" form:"id" gorm:"primaryKey;autoIncrement"`     // Unique identifier
+	Tag            string `json:"tag" form:"tag" gorm:"unique"`                     // Xray tag, unique across configuration
+	Protocol       string `json:"protocol" form:"protocol"`                         // Protocol: vless/vmess/trojan/freedom/socks/http
+	Security       string `json:"security" form:"security" gorm:"type:varchar(16)"` // Security type: none/tls/reality
+	Settings       string `json:"settings" form:"settings"`                         // Protocol-specific settings (JSON)
+	StreamSettings string `json:"streamSettings" form:"streamSettings"`             // Transport settings (JSON)
+	Mux            string `json:"mux" form:"mux"`                                   // Multiplexing settings (JSON)
+	ProxySettings  string `json:"proxySettings" form:"proxySettings"`               // Proxy chain settings (JSON)
+	Remark         string `json:"remark" form:"remark"`                             // Human-readable description
+	Enable         bool   `json:"enable" form:"enable" gorm:"default:true"`         // Whether the outbound is enabled
+}
+
 // OutboundTraffics tracks traffic statistics for Xray outbound connections.
 type OutboundTraffics struct {
-	Id    int    `json:"id" form:"id" gorm:"primaryKey;autoIncrement"`
-	Tag   string `json:"tag" form:"tag" gorm:"unique"`
-	Up    int64  `json:"up" form:"up" gorm:"default:0"`
-	Down  int64  `json:"down" form:"down" gorm:"default:0"`
-	Total int64  `json:"total" form:"total" gorm:"default:0"`
+	OutboundID int      `json:"outboundId" gorm:"primaryKey;not null"`                                                     // Primary key and foreign key to Outbound
+	Outbound   Outbound `json:"-" gorm:"constraint:OnUpdate:CASCADE,OnDelete:CASCADE;foreignKey:OutboundID;references:ID"` // 1:1 relation with cascade
+	Up         int64    `json:"up" form:"up" gorm:"default:0"`
+	Down       int64    `json:"down" form:"down" gorm:"default:0"`
+	Total      int64    `json:"total" form:"total" gorm:"default:0"`
 }
 
 // InboundClientIps stores IP addresses associated with inbound clients for access control.
@@ -74,7 +88,7 @@ type InboundClientIps struct {
 // HistoryOfSeeders tracks which database seeders have been executed to prevent re-running.
 type HistoryOfSeeders struct {
 	Id         int    `json:"id" gorm:"primaryKey;autoIncrement"`
-	SeederName string `json:"seederName"`
+	SeederName string `json:"seederName" gorm:"unique"`
 }
 
 // GenXrayInboundConfig generates an Xray inbound configuration from the Inbound model.
@@ -94,12 +108,41 @@ func (i *Inbound) GenXrayInboundConfig() *xray.InboundConfig {
 	}
 }
 
+// GenXrayOutboundConfig generates an Xray outbound configuration from the Outbound model.
+func (o *Outbound) GenXrayOutboundConfig() *xray.OutboundConfig {
+	return &xray.OutboundConfig{
+		Tag:            o.Tag,
+		Protocol:       o.Protocol,
+		Settings:       json_util.RawMessage(o.Settings),
+		StreamSettings: json_util.RawMessage(o.StreamSettings),
+		ProxySettings:  json_util.RawMessage(o.ProxySettings),
+		Mux:            json_util.RawMessage(o.Mux),
+	}
+}
+
 // Setting stores key-value configuration settings for the 3x-ui panel.
 type Setting struct {
 	Id    int    `json:"id" form:"id" gorm:"primaryKey;autoIncrement"`
-	Key   string `json:"key" form:"key"`
+	Key   string `json:"key" form:"key" gorm:"unique"`
 	Value string `json:"value" form:"value"`
 }
+
+// Xray configuration section keys stored in Settings table
+const (
+	KeyLog          = "xray.log"
+	KeyAPI          = "xray.api"
+	KeyPolicy       = "xray.policy"
+	KeyRouting      = "xray.routing"
+	KeyStats        = "xray.stats"
+	KeyMetrics      = "xray.metrics"
+	KeyTransport    = "xray.transport"
+	KeyDNS          = "xray.dns"
+	KeyReverse      = "xray.reverse"
+	KeyFakeDNS      = "xray.fakedns"
+	KeyObservatory  = "xray.observatory"
+	KeyBurstObserv  = "xray.burstObservatory"
+	KeyXrayTemplate = "xray.template" // Template config with api-inbound only
+)
 
 // Client represents a client configuration for Xray inbounds with traffic limits and settings.
 type Client struct {

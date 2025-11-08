@@ -4,13 +4,16 @@ package database
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
 	"os"
 	"path"
 	"slices"
+	"strings"
 
 	"github.com/mhsanaei/3x-ui/v2/config"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
@@ -19,6 +22,7 @@ import (
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -33,6 +37,7 @@ func initModels() error {
 	models := []any{
 		&model.User{},
 		&model.Inbound{},
+		&model.Outbound{},
 		&model.OutboundTraffics{},
 		&model.Setting{},
 		&model.InboundClientIps{},
@@ -46,6 +51,24 @@ func initModels() error {
 		}
 	}
 	return nil
+}
+
+func SetJSON(db *gorm.DB, key string, raw []byte) error {
+	return db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "key"}},
+		DoUpdates: clause.AssignmentColumns([]string{"value"}),
+	}).Create(&model.Setting{
+		Key:   key,
+		Value: string(raw),
+	}).Error
+}
+
+func GetJSON(db *gorm.DB, key string) ([]byte, error) {
+	var s model.Setting
+	if err := db.Where("key = ?", key).First(&s).Error; err != nil {
+		return nil, err
+	}
+	return []byte(s.Value), nil
 }
 
 // initUser creates a default admin user if the users table is empty.
@@ -84,7 +107,9 @@ func runSeeders(isUsersEmpty bool) error {
 		hashSeeder := &model.HistoryOfSeeders{
 			SeederName: "UserPasswordHash",
 		}
-		return db.Create(hashSeeder).Error
+		if err := db.Create(hashSeeder).Error; err != nil {
+			return err
+		}
 	} else {
 		var seedersHistory []string
 		db.Model(&model.HistoryOfSeeders{}).Pluck("seeder_name", &seedersHistory)
@@ -105,11 +130,149 @@ func runSeeders(isUsersEmpty bool) error {
 			hashSeeder := &model.HistoryOfSeeders{
 				SeederName: "UserPasswordHash",
 			}
-			return db.Create(hashSeeder).Error
+			if err := db.Create(hashSeeder).Error; err != nil {
+				return err
+			}
+		}
+	}
+
+	// Run xray config initialization seeder
+	var seedersHistory []string
+	db.Model(&model.HistoryOfSeeders{}).Pluck("seeder_name", &seedersHistory)
+
+	if !slices.Contains(seedersHistory, "XrayConfigInit") {
+		if err := seedXrayConfigFromFile(); err != nil {
+			log.Printf("Error seeding xray config: %v", err)
+			return err
 		}
 	}
 
 	return nil
+}
+
+// seedXrayConfigFromFile reads xray.config.json once and initializes DB.
+func seedXrayConfigFromFile() error {
+	configPath := xray.GetConfigPath()
+	configData, err := os.ReadFile(configPath)
+
+	if err != nil {
+		log.Printf("Warning: Could not read xray config from %s: %v", configPath, err)
+		var existing model.HistoryOfSeeders
+		if err := db.Where("seeder_name = ?", "XrayConfigInit").First(&existing).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				seeder := &model.HistoryOfSeeders{SeederName: "XrayConfigInit"}
+				return db.Create(seeder).Error
+			}
+			return err
+		}
+		return nil
+	}
+
+	var configMap map[string]any
+	if err := json.Unmarshal(configData, &configMap); err != nil {
+		log.Printf("Error parsing xray.config.json: %v", err)
+		return err
+	}
+
+	saveSection := func(key string) {
+		if v, ok := configMap[strings.TrimPrefix(key, "xray.")]; ok {
+			if v == nil {
+				return
+			}
+			raw, _ := json.Marshal(v)
+			if len(raw) == 0 || string(raw) == "null" {
+				return
+			}
+			if err := SetJSON(db, key, raw); err != nil {
+				log.Printf("Error saving section %s: %v", key, err)
+			}
+		}
+	}
+
+	saveSection(model.KeyLog)
+	saveSection(model.KeyAPI)
+	saveSection(model.KeyPolicy)
+	saveSection(model.KeyRouting)
+	saveSection(model.KeyStats)
+	saveSection(model.KeyMetrics)
+	saveSection(model.KeyTransport)
+	saveSection(model.KeyDNS)
+	saveSection(model.KeyReverse)
+	saveSection(model.KeyFakeDNS)
+	saveSection(model.KeyObservatory)
+	saveSection(model.KeyBurstObserv)
+
+	apiInbounds := []any{}
+	if inboundsAny, ok := configMap["inbounds"].([]any); ok {
+		for _, inbound := range inboundsAny {
+			if m, ok := inbound.(map[string]any); ok && m["tag"] == "api" {
+				apiInbounds = append(apiInbounds, inbound)
+			}
+		}
+	}
+
+	templateConfig := map[string]any{
+		"inbounds":  apiInbounds,
+		"outbounds": []any{},
+	}
+
+	templateBytes, _ := json.MarshalIndent(templateConfig, "", "  ")
+	if err := SetJSON(db, model.KeyXrayTemplate, templateBytes); err != nil {
+		log.Printf("Error saving xray template: %v", err)
+	}
+
+	if outboundsAny, ok := configMap["outbounds"].([]any); ok {
+		for _, outboundAny := range outboundsAny {
+			outboundMap, ok := outboundAny.(map[string]any)
+			if !ok {
+				continue
+			}
+			tag, _ := outboundMap["tag"].(string)
+			protocol, _ := outboundMap["protocol"].(string)
+			if tag == "" || protocol == "" {
+				continue
+			}
+			var existing model.Outbound
+			err := db.Where("tag = ?", tag).First(&existing).Error
+			if err != nil && err != gorm.ErrRecordNotFound {
+				return err
+			}
+			if err != gorm.ErrRecordNotFound {
+				log.Printf("Outbound '%s' already exists, skipping", tag)
+				continue
+			}
+			settingsBytes, _ := json.Marshal(outboundMap["settings"])
+			streamSettingsBytes, _ := json.Marshal(outboundMap["streamSettings"])
+			muxBytes, _ := json.Marshal(outboundMap["mux"])
+			proxySettingsBytes, _ := json.Marshal(outboundMap["proxySettings"])
+
+			outbound := model.Outbound{
+				Tag:            tag,
+				Protocol:       protocol,
+				Settings:       string(settingsBytes),
+				StreamSettings: string(streamSettingsBytes),
+				Mux:            string(muxBytes),
+				ProxySettings:  string(proxySettingsBytes),
+				Remark:         fmt.Sprintf("Default %s outbound", tag),
+				Enable:         true,
+			}
+			if err := db.Create(&outbound).Error; err != nil {
+				log.Printf("Error creating outbound '%s': %v", tag, err)
+				return err
+			}
+			log.Printf("Created outbound from config: %s", tag)
+		}
+	}
+
+	var existing model.HistoryOfSeeders
+	if err := db.Where("seeder_name = ?", "XrayConfigInit").First(&existing).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			seeder := &model.HistoryOfSeeders{SeederName: "XrayConfigInit"}
+			return db.Create(seeder).Error
+		}
+		return err
+	}
+	return nil // Seeder already exists
 }
 
 // isTableEmpty returns true if the named table contains zero rows.
@@ -121,26 +284,29 @@ func isTableEmpty(tableName string) (bool, error) {
 
 // InitDB sets up the database connection, migrates models, and runs seeders.
 func InitDB(dbPath string) error {
-	dir := path.Dir(dbPath)
-	err := os.MkdirAll(dir, fs.ModePerm)
-	if err != nil {
+	if err := os.MkdirAll(path.Dir(dbPath), fs.ModePerm); err != nil {
 		return err
 	}
 
 	var gormLogger logger.Interface
-
 	if config.IsDebug() {
-		gormLogger = logger.Default
+		gormLogger = logger.Default.LogMode(logger.Warn)
 	} else {
 		gormLogger = logger.Discard
 	}
 
-	c := &gorm.Config{
-		Logger: gormLogger,
-	}
-	db, err = gorm.Open(sqlite.Open(dbPath), c)
+	// Enable foreign keys for all connections via DSN
+	dsn := dbPath + "?_foreign_keys=on&_busy_timeout=5000"
+	var err error
+	db, err = gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: gormLogger})
 	if err != nil {
 		return err
+	}
+
+	// Verify foreign keys are enabled
+	var fk int
+	if err := db.Raw("PRAGMA foreign_keys").Scan(&fk).Error; err == nil && fk != 1 && config.IsDebug() {
+		log.Printf("WARNING: SQLite foreign_keys=OFF - CASCADE will not work")
 	}
 
 	if err := initModels(); err != nil {

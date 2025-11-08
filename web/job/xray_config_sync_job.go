@@ -7,6 +7,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/web/service"
+	"github.com/mhsanaei/3x-ui/v2/xray"
 )
 
 // XrayConfigSyncJob periodically synchronizes Xray configuration from database.
@@ -40,10 +41,15 @@ func (j *XrayConfigSyncJob) Run() {
 		return
 	}
 
-	// Get all enabled inbounds from database
+	j.syncInbounds(xrayAPI)
+	j.syncOutbounds(xrayAPI)
+}
+
+// syncInbounds synchronizes enabled inbounds from DB to Xray.
+func (j *XrayConfigSyncJob) syncInbounds(xrayAPI *xray.XrayAPI) {
 	db := database.GetDB()
 	var dbInbounds []*model.Inbound
-	err = db.Model(&model.Inbound{}).Where("enable = ?", true).Find(&dbInbounds).Error
+	err := db.Model(&model.Inbound{}).Where("enable = ?", true).Find(&dbInbounds).Error
 	if err != nil {
 		logger.Warning("[SYNC] Database error:", err)
 		return
@@ -53,13 +59,11 @@ func (j *XrayConfigSyncJob) Run() {
 		return
 	}
 
-	// Get current inbound tags from running Xray
 	currentTags, err := xrayAPI.ListInboundTags()
 	if err != nil {
 		return
 	}
 
-	// Build maps for comparison
 	currentTagsMap := make(map[string]bool)
 	for _, tag := range currentTags {
 		currentTagsMap[tag] = true
@@ -70,17 +74,14 @@ func (j *XrayConfigSyncJob) Run() {
 		expectedTags[inbound.Tag] = inbound
 	}
 
-	// Check which inbounds need to be added
 	addedCount := 0
 	failedCount := 0
 
 	for tag, inbound := range expectedTags {
-		// Check if inbound already exists in Xray
 		if currentTagsMap[tag] {
 			continue
 		}
 
-		// Inbound is missing - add it
 		inboundJson, err := json.MarshalIndent(inbound.GenXrayInboundConfig(), "", "  ")
 		if err != nil {
 			failedCount++
@@ -91,12 +92,11 @@ func (j *XrayConfigSyncJob) Run() {
 		if err == nil {
 			addedCount++
 		} else {
-			// Check if error is "already exists" (race condition)
 			errMsg := err.Error()
 			if contains(errMsg, "already exists") || contains(errMsg, "address already in use") {
 				addedCount++
 			} else {
-				logger.Warning("[SYNC] Failed to add", tag)
+				logger.Warning("[SYNC] Failed to add inbound", tag)
 				failedCount++
 			}
 		}
@@ -107,6 +107,73 @@ func (j *XrayConfigSyncJob) Run() {
 	}
 	if failedCount > 0 {
 		logger.Warning("[SYNC] Failed to add", failedCount, "inbound(s)")
+	}
+}
+
+// syncOutbounds synchronizes enabled outbounds from DB to Xray.
+func (j *XrayConfigSyncJob) syncOutbounds(xrayAPI *xray.XrayAPI) {
+	db := database.GetDB()
+	var dbOutbounds []*model.Outbound
+	err := db.Model(&model.Outbound{}).Where("enable = ?", true).Find(&dbOutbounds).Error
+	if err != nil {
+		logger.Warning("[SYNC] Database error:", err)
+		return
+	}
+
+	if len(dbOutbounds) == 0 {
+		return
+	}
+
+	// Get current outbound tags from Xray
+	currentTags, err := xrayAPI.ListOutboundTags()
+	if err != nil {
+		logger.Warning("[SYNC] Failed to get outbound tags:", err)
+		return
+	}
+
+	currentTagsMap := make(map[string]bool)
+	for _, tag := range currentTags {
+		currentTagsMap[tag] = true
+	}
+
+	// Build expected outbounds map
+	expectedTags := make(map[string]*model.Outbound)
+	for _, outbound := range dbOutbounds {
+		expectedTags[outbound.Tag] = outbound
+	}
+
+	addedCount := 0
+	failedCount := 0
+	for tag, outbound := range expectedTags {
+		if currentTagsMap[tag] {
+			continue
+		}
+
+		outboundJson, err := json.MarshalIndent(outbound.GenXrayOutboundConfig(), "", "  ")
+		if err != nil {
+			failedCount++
+			continue
+		}
+
+		err = xrayAPI.AddOutbound(outboundJson)
+		if err == nil {
+			addedCount++
+		} else {
+			errMsg := err.Error()
+			if contains(errMsg, "already exists") || contains(errMsg, "existing tag found") {
+				addedCount++
+			} else {
+				logger.Warning("[SYNC] Failed to add outbound", tag)
+				failedCount++
+			}
+		}
+	}
+
+	if addedCount > 0 {
+		logger.Info("[SYNC] Added", addedCount, "outbound(s)")
+	}
+	if failedCount > 0 {
+		logger.Warning("[SYNC] Failed to add", failedCount, "outbound(s)")
 	}
 }
 

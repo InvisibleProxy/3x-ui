@@ -10,17 +10,18 @@ import (
 
 // GetBinaryPath returns the full path to the Xray binary executable.
 func GetBinaryPath() string {
-	// Check for custom binary path from environment variable
 	if customPath := os.Getenv("XRAY_BINARY_PATH"); customPath != "" {
 		return customPath
 	}
-	// Default path for Docker/Linux
 	return "/usr/bin/xray"
 }
 
 // GetConfigPath returns the path to the Xray configuration file.
 func GetConfigPath() string {
-	return config.GetBinFolderPath() + "/config.json"
+	if customPath := os.Getenv("XRAY_CONFIG_PATH"); customPath != "" {
+		return customPath
+	}
+	return "/etc/xray/config.json"
 }
 
 // GetGeositePath returns the path to the geosite data file.

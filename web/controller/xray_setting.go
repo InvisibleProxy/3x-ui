@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"encoding/json"
+
 	"github.com/mhsanaei/3x-ui/v2/web/service"
 
 	"github.com/gin-gonic/gin"
@@ -36,9 +38,9 @@ func (a *XraySettingController) initRouter(g *gin.RouterGroup) {
 	g.POST("/resetOutboundsTraffic", a.resetOutboundsTraffic)
 }
 
-// getXraySetting retrieves the Xray configuration template and inbound tags.
+// getXraySetting retrieves virtual config (template + all outbounds from DB) and inbound tags.
 func (a *XraySettingController) getXraySetting(c *gin.Context) {
-	xraySetting, err := a.SettingService.GetXrayConfigTemplate()
+	virtualConfig, err := a.XrayService.GetVirtualConfigJSON()
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.getSettings"), err)
 		return
@@ -48,25 +50,29 @@ func (a *XraySettingController) getXraySetting(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.getSettings"), err)
 		return
 	}
-	xrayResponse := "{ \"xraySetting\": " + xraySetting + ", \"inboundTags\": " + inboundTags + " }"
+
+	// Convert to JSON string for response
+	xraySettingBytes, _ := json.Marshal(virtualConfig)
+	inboundTagsBytes, _ := json.Marshal(inboundTags)
+	xrayResponse := "{ \"xraySetting\": " + string(xraySettingBytes) + ", \"inboundTags\": " + string(inboundTagsBytes) + " }"
 	jsonObj(c, xrayResponse, nil)
 }
 
-// updateSetting updates the Xray configuration settings.
+// updateSetting parses virtual config and updates DB (template + inbounds + outbounds).
 func (a *XraySettingController) updateSetting(c *gin.Context) {
 	xraySetting := c.PostForm("xraySetting")
-	err := a.XraySettingService.SaveXraySetting(xraySetting)
+	err := a.XrayService.ApplyVirtualConfig(xraySetting)
 	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
 }
 
-// getDefaultXrayConfig retrieves the default Xray configuration.
+// getDefaultXrayConfig retrieves full Xray config built from DB (all sections + inbounds + outbounds).
 func (a *XraySettingController) getDefaultXrayConfig(c *gin.Context) {
-	defaultJsonConfig, err := a.SettingService.GetDefaultXrayConfig()
+	fullConfig, err := a.XrayService.GetFullXrayConfigFromDB()
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.getSettings"), err)
 		return
 	}
-	jsonObj(c, defaultJsonConfig, nil)
+	jsonObj(c, fullConfig, nil)
 }
 
 // getXrayResult retrieves the current Xray service result.
@@ -106,7 +112,27 @@ func (a *XraySettingController) getOutboundsTraffic(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.getOutboundTrafficError"), err)
 		return
 	}
-	jsonObj(c, outboundsTraffic, nil)
+
+	type traffic struct {
+		Tag   string `json:"tag"`
+		Up    int64  `json:"up"`
+		Down  int64  `json:"down"`
+		Total int64  `json:"total"`
+	}
+
+	result := make([]traffic, 0, len(outboundsTraffic))
+	for _, t := range outboundsTraffic {
+		if t.Outbound.Tag != "" {
+			result = append(result, traffic{
+				Tag:   t.Outbound.Tag,
+				Up:    t.Up,
+				Down:  t.Down,
+				Total: t.Total,
+			})
+		}
+	}
+
+	jsonObj(c, result, nil)
 }
 
 // resetOutboundsTraffic resets the traffic statistics for the specified outbound tag.
