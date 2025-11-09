@@ -6,54 +6,31 @@ FROM alpine:3.19 AS downloader
 ARG TARGETPLATFORM
 ARG XRAY_VERSION=25.10.15
 
-# Install download tools
-RUN apk add --no-cache wget unzip bash
+# Install tools, download Xray and geo files in single layer
+RUN apk add --no-cache wget unzip bash && \
+    mkdir -p /usr/share/xray
 
-WORKDIR /tmp/xray
-
-# Download Xray Core binary using script
-COPY xray.sh /tmp/xray/xray.sh
-RUN sed -i 's/\r$//' /tmp/xray/xray.sh \
-    && chmod +x /tmp/xray/xray.sh \
-    && /tmp/xray/xray.sh "${TARGETPLATFORM}" "${XRAY_VERSION}"
-
-# Download geo files (separate layer for better caching)
-RUN mkdir -p /usr/share/xray && cd /usr/share/xray && \
-    echo "Downloading geo files..." && \
-    wget --progress=dot:mega -O geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat && \
-    wget --progress=dot:mega -O geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat && \
-    (wget --progress=dot:mega -O geoip_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geoip.dat || echo "Warning: IR geoip not available") && \
-    (wget --progress=dot:mega -O geosite_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat || echo "Warning: IR geosite not available") && \
-    (wget --progress=dot:mega -O geoip_RU.dat https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat || echo "Warning: RU geoip not available") && \
-    (wget --progress=dot:mega -O geosite_RU.dat https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat || echo "Warning: RU geosite not available") && \
-    echo "Geo files downloaded successfully"
+COPY --chmod=755 xray.sh /tmp/xray.sh
+RUN /tmp/xray.sh "${TARGETPLATFORM}" "${XRAY_VERSION}" && \
+    wget --progress=dot:mega -O /usr/share/xray/geoip.dat https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat && \
+    wget --progress=dot:mega -O /usr/share/xray/geosite.dat https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat
 
 # ========================================================
-
+# Stage 2: Runtime image
+# ========================================================
 FROM alpine:3.19
 
 WORKDIR /etc/xray
 
-# Install runtime dependencies
+# Install runtime dependencies and create directories
 RUN apk add --no-cache ca-certificates tzdata bash && \
-    mkdir -p /var/log/xray /usr/local/share/xray && \
-    rm -rf /var/cache/apk/*
+    mkdir -p /var/log/xray /usr/local/share/xray
 
 # Copy Xray binary and geo files from downloader
 COPY --from=downloader /usr/bin/xray /usr/bin/xray
 COPY --from=downloader /usr/share/xray/*.dat /usr/local/share/xray/
 
 ARG XRAY_VERSION=25.10.15
-ENV TZ=Asia/Tehran
 ENV XRAY_CORE_VERSION=${XRAY_VERSION}
-
-VOLUME /etc/xray
-VOLUME /var/log/xray
-
-EXPOSE 443
-EXPOSE 10085
-
-HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
-  CMD xray api stats --server=127.0.0.1:10085 || exit 1
 
 CMD ["/usr/bin/xray", "run", "-c", "/etc/xray/config.json"]

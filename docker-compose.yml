@@ -16,11 +16,12 @@ services:
       - "443:443"
       - "10085:10085"
     volumes:
-      - ./web/service/config.json:/etc/xray/config.json:ro
+      - ./web/service/xray.template.json:/etc/xray/config.json:ro
       - xray-logs:/var/log/xray
       - xray-assets:/usr/local/share/xray
     environment:
       - XRAY_CORE_VERSION=25.10.15
+      - XRAY_LOCATION_ASSET=/usr/local/share/xray
       - TZ=Asia/Tehran
     healthcheck:
       test: ["CMD", "pidof", "xray"]
@@ -65,6 +66,7 @@ services:
       - XUI_LOG_LEVEL=debug
       - XRAY_BINARY_PATH=/usr/bin/xray
       - XRAY_CONFIG_PATH=/etc/xray/config.json
+      - XRAY_LOCATION_ASSET=/usr/local/share/xray
     tty: true
 
 networks:
