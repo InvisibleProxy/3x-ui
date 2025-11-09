@@ -34,6 +34,30 @@ func (s *InboundService) SetXrayAPI(api *xray.XrayAPI) {
 	s.xrayApi = api
 }
 
+// addClientToXray adds a client to Xray via gRPC API.
+func (s *InboundService) addClientToXray(inbound *model.Inbound, client *model.Client) error {
+	if s.xrayApi == nil {
+		return fmt.Errorf("xray API not available")
+	}
+
+	cipher := ""
+	if inbound.Protocol == "shadowsocks" {
+		var settings map[string]any
+		if err := json.Unmarshal([]byte(inbound.Settings), &settings); err == nil {
+			cipher, _ = settings["method"].(string)
+		}
+	}
+
+	return s.xrayApi.AddUser(string(inbound.Protocol), inbound.Tag, map[string]any{
+		"email":    client.Email,
+		"id":       client.ID,
+		"security": client.Security,
+		"flow":     client.Flow,
+		"password": client.Password,
+		"cipher":   cipher,
+	})
+}
+
 // GetInbounds retrieves all inbounds for a specific user.
 // Returns a slice of inbound models with their associated client statistics.
 func (s *InboundService) GetInbounds(userId int) ([]*model.Inbound, error) {
@@ -649,19 +673,7 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 			if len(client.Email) > 0 {
 				s.AddClientStat(tx, data.Id, &client)
 				if client.Enable {
-					cipher := ""
-					if oldInbound.Protocol == "shadowsocks" {
-						cipher = oldSettings["method"].(string)
-					}
-					err1 := s.xrayApi.AddUser(string(oldInbound.Protocol), oldInbound.Tag, map[string]any{
-						"email":    client.Email,
-						"id":       client.ID,
-						"security": client.Security,
-						"flow":     client.Flow,
-						"password": client.Password,
-						"cipher":   cipher,
-					})
-					if err1 == nil {
+					if err1 := s.addClientToXray(oldInbound, &client); err1 == nil {
 						logger.Debug("Client added by api:", client.Email)
 					} else {
 						logger.Debug("Error in adding client by api:", err1)
@@ -910,19 +922,7 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 			}
 		}
 		if clients[0].Enable {
-			cipher := ""
-			if oldInbound.Protocol == "shadowsocks" {
-				cipher = oldSettings["method"].(string)
-			}
-			err1 := s.xrayApi.AddUser(string(oldInbound.Protocol), oldInbound.Tag, map[string]any{
-				"email":    clients[0].Email,
-				"id":       clients[0].ID,
-				"security": clients[0].Security,
-				"flow":     clients[0].Flow,
-				"password": clients[0].Password,
-				"cipher":   cipher,
-			})
-			if err1 == nil {
+			if err1 := s.addClientToXray(oldInbound, &clients[0]); err1 == nil {
 				logger.Debug("Client edited by api:", clients[0].Email)
 			} else {
 				logger.Debug("Error in adding client by api:", err1)
@@ -936,7 +936,20 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 	return needRestart, tx.Save(oldInbound).Error
 }
 
-func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraffics []*xray.ClientTraffic) (error, bool) {
+// ProcessTrafficStats updates traffic statistics and manages client states.
+// Called from CollectTraffic job every 10 seconds.
+//
+// Business logic (within single transaction):
+// 1. addInboundTraffic - updates traffic counters for inbounds
+// 2. addClientTraffic - updates traffic counters for clients
+// 3. autoRenewClients - renews clients with reset > 0 (re-enables + resets traffic)
+// 4. disableExceededClients - disables clients with exceeded traffic/expiry
+// 5. disableExceededInbounds - disables inbounds with exceeded traffic/expiry
+//
+// Note: Xray API synchronization is handled by separate SyncXray job
+//
+// Returns: error
+func (s *InboundService) ProcessTrafficStats(inboundTraffics []*xray.Traffic, clientTraffics []*xray.ClientTraffic) error {
 	var err error
 	db := database.GetDB()
 	tx := db.Begin()
@@ -948,38 +961,47 @@ func (s *InboundService) AddTraffic(inboundTraffics []*xray.Traffic, clientTraff
 			tx.Commit()
 		}
 	}()
+
 	err = s.addInboundTraffic(tx, inboundTraffics)
 	if err != nil {
-		return err, false
-	}
-	err = s.addClientTraffic(tx, clientTraffics)
-	if err != nil {
-		return err, false
+		return err
 	}
 
-	needRestart0, count, err := s.autoRenewClients(tx)
+	err = s.addClientTraffic(tx, clientTraffics)
+	if err != nil {
+		return err
+	}
+
+	count, err := s.autoRenewClients(tx)
 	if err != nil {
 		logger.Warning("Error in renew clients:", err)
 	} else if count > 0 {
 		logger.Debugf("%v clients renewed", count)
 	}
 
-	needRestart1, count, err := s.disableInvalidClients(tx)
+	count, err = s.disableExceededClients(tx)
 	if err != nil {
-		logger.Warning("Error in disabling invalid clients:", err)
+		logger.Warning("Error in disabling exceeded clients:", err)
 	} else if count > 0 {
 		logger.Debugf("%v clients disabled", count)
 	}
 
-	needRestart2, count, err := s.disableInvalidInbounds(tx)
+	count, err = s.disableExceededInbounds(tx)
 	if err != nil {
-		logger.Warning("Error in disabling invalid inbounds:", err)
+		logger.Warning("Error in disabling exceeded inbounds:", err)
 	} else if count > 0 {
 		logger.Debugf("%v inbounds disabled", count)
 	}
-	return nil, (needRestart0 || needRestart1 || needRestart2)
+
+	return nil
 }
 
+// addInboundTraffic updates traffic counters for inbounds.
+//
+// Business logic:
+// 1. Gets current traffic (up, down) from Xray for each inbound
+// 2. Adds traffic to existing DB values (increment)
+// 3. Updates all_time counter (total traffic lifetime)
 func (s *InboundService) addInboundTraffic(tx *gorm.DB, traffics []*xray.Traffic) error {
 	if len(traffics) == 0 {
 		return nil
@@ -1003,9 +1025,16 @@ func (s *InboundService) addInboundTraffic(tx *gorm.DB, traffics []*xray.Traffic
 	return nil
 }
 
+// addClientTraffic updates traffic counters for clients.
+//
+// Business logic:
+// 1. Gets list of client emails from Xray statistics
+// 2. Loads their records from DB (client_traffics)
+// 3. Adds new traffic to current values (up, down, all_time)
+// 4. Updates last_online for active clients (who have traffic > 0)
+// 5. Updates global onlineClients list
 func (s *InboundService) addClientTraffic(tx *gorm.DB, traffics []*xray.ClientTraffic) (err error) {
 	if len(traffics) == 0 {
-		// Empty onlineUsers
 		onlineClients = nil
 		return nil
 	}
@@ -1117,36 +1146,40 @@ func (s *InboundService) adjustTraffics(tx *gorm.DB, dbClientTraffics []*xray.Cl
 	return dbClientTraffics, nil
 }
 
-func (s *InboundService) autoRenewClients(tx *gorm.DB) (bool, int64, error) {
-	// check for time expired
+// autoRenewClients automatically renews clients with expired time.
+//
+// Business logic:
+// 1. Finds clients where reset > 0 (auto-renewal enabled) AND time expired
+// 2. Extends expiry: newExpiry = oldExpiry + (reset * 86400000 ms)
+// 3. Resets traffic: up = 0, down = 0
+// 4. If client was disabled (enable=false), re-enables it (enable=true)
+// 5. Saves changes to DB
+//
+// Note: Xray API synchronization is handled by SyncXray job
+//
+// Returns: (number of renewed clients, error)
+func (s *InboundService) autoRenewClients(tx *gorm.DB) (int64, error) {
 	var traffics []*xray.ClientTraffic
 	now := time.Now().Unix() * 1000
-	var err, err1 error
+	var err error
 
 	err = tx.Model(xray.ClientTraffic{}).Where("reset > 0 and expiry_time > 0 and expiry_time <= ?", now).Find(&traffics).Error
 	if err != nil {
-		return false, 0, err
+		return 0, err
 	}
-	// return if there is no client to renew
 	if len(traffics) == 0 {
-		return false, 0, nil
+		return 0, nil
 	}
 
 	var inbound_ids []int
 	var inbounds []*model.Inbound
-	needRestart := false
-	var clientsToAdd []struct {
-		protocol string
-		tag      string
-		client   map[string]any
-	}
 
 	for _, traffic := range traffics {
 		inbound_ids = append(inbound_ids, traffic.InboundId)
 	}
 	err = tx.Model(model.Inbound{}).Where("id IN ?", inbound_ids).Find(&inbounds).Error
 	if err != nil {
-		return false, 0, err
+		return 0, err
 	}
 	for inbound_index := range inbounds {
 		settings := map[string]any{}
@@ -1166,16 +1199,7 @@ func (s *InboundService) autoRenewClients(tx *gorm.DB) (bool, int64, error) {
 					traffics[traffic_index].Up = 0
 					if !traffic.Enable {
 						traffics[traffic_index].Enable = true
-						clientsToAdd = append(clientsToAdd,
-							struct {
-								protocol string
-								tag      string
-								client   map[string]any
-							}{
-								protocol: string(inbounds[inbound_index].Protocol),
-								tag:      inbounds[inbound_index].Tag,
-								client:   c,
-							})
+						logger.Debugf("Client %s renewed and re-enabled", traffic.Email)
 					}
 					clients[client_index] = any(c)
 					break
@@ -1185,107 +1209,68 @@ func (s *InboundService) autoRenewClients(tx *gorm.DB) (bool, int64, error) {
 		settings["clients"] = clients
 		newSettings, err := json.MarshalIndent(settings, "", "  ")
 		if err != nil {
-			return false, 0, err
+			return 0, err
 		}
 		inbounds[inbound_index].Settings = string(newSettings)
 	}
 	err = tx.Save(inbounds).Error
 	if err != nil {
-		return false, 0, err
+		return 0, err
 	}
 	err = tx.Save(traffics).Error
 	if err != nil {
-		return false, 0, err
+		return 0, err
 	}
 
-	if s.xrayApi == nil {
-		return true, int64(len(traffics)), nil
-	}
-	for _, clientToAdd := range clientsToAdd {
-		err1 = s.xrayApi.AddUser(clientToAdd.protocol, clientToAdd.tag, clientToAdd.client)
-		if err1 != nil {
-			needRestart = true
-		}
-	}
-
-	return needRestart, int64(len(traffics)), nil
+	return int64(len(traffics)), nil
 }
 
-func (s *InboundService) disableInvalidInbounds(tx *gorm.DB) (bool, int64, error) {
+// disableExceededInbounds disables inbounds with exceeded limits.
+//
+// Business logic:
+// 1. Finds inbounds where enable=true AND (traffic exceeded OR time expired)
+// 2. Sets enable=false in DB for all found inbounds
+//
+// Note: Xray API synchronization (removing inbounds) is handled by SyncXray job
+//
+// Returns: (number of disabled inbounds, error)
+func (s *InboundService) disableExceededInbounds(tx *gorm.DB) (int64, error) {
 	now := time.Now().Unix() * 1000
-	needRestart := false
-
-	var tags []string
-	err := tx.Table("inbounds").
-		Select("inbounds.tag").
-		Where("((total > 0 and up + down >= total) or (expiry_time > 0 and expiry_time <= ?)) and enable = ?", now, true).
-		Scan(&tags).Error
-	if err != nil {
-		return false, 0, err
-	}
-	if s.xrayApi != nil {
-		for _, tag := range tags {
-			err1 := s.xrayApi.DelInbound(tag)
-			if err1 == nil {
-				logger.Debug("Inbound disabled by api:", tag)
-			} else {
-				logger.Debug("Error in disabling inbound by api:", err1)
-				needRestart = true
-			}
-		}
-	}
 
 	result := tx.Model(model.Inbound{}).
 		Where("((total > 0 and up + down >= total) or (expiry_time > 0 and expiry_time <= ?)) and enable = ?", now, true).
 		Update("enable", false)
-	err = result.Error
+
 	count := result.RowsAffected
-	return needRestart, count, err
+	if count > 0 {
+		logger.Debugf("Disabled %d inbound(s) with exceeded limits in DB", count)
+	}
+
+	return count, result.Error
 }
 
-func (s *InboundService) disableInvalidClients(tx *gorm.DB) (bool, int64, error) {
+// disableExceededClients disables clients with exceeded limits.
+//
+// Business logic:
+// 1. Finds clients where enable=true AND (traffic exceeded OR time expired)
+// 2. Sets enable=false in DB for all found clients
+//
+// Note: Xray API synchronization (removing clients) is handled by SyncXray job
+//
+// Returns: (number of disabled clients, error)
+func (s *InboundService) disableExceededClients(tx *gorm.DB) (int64, error) {
 	now := time.Now().Unix() * 1000
-	needRestart := false
-
-	var results []struct {
-		Tag   string
-		Email string
-	}
-
-	err := tx.Table("inbounds").
-		Select("inbounds.tag, client_traffics.email").
-		Joins("JOIN client_traffics ON inbounds.id = client_traffics.inbound_id").
-		Where("((client_traffics.total > 0 AND client_traffics.up + client_traffics.down >= client_traffics.total) OR (client_traffics.expiry_time > 0 AND client_traffics.expiry_time <= ?)) AND client_traffics.enable = ?", now, true).
-		Scan(&results).Error
-	if err != nil {
-		return false, 0, err
-	}
-	if s.xrayApi != nil {
-		for _, result := range results {
-			err1 := s.xrayApi.RemoveUser(result.Tag, result.Email)
-			if err1 == nil {
-				logger.Debug("Client disabled by api:", result.Email)
-			} else {
-				if strings.Contains(err1.Error(), fmt.Sprintf("User %s not found.", result.Email)) {
-					logger.Debug("User is already disabled. Nothing to do more...")
-				} else {
-					if strings.Contains(err1.Error(), fmt.Sprintf("User %s not found.", result.Email)) {
-						logger.Debug("User is already disabled. Nothing to do more...")
-					} else {
-						logger.Debug("Error in disabling client by api:", err1)
-						needRestart = true
-					}
-				}
-			}
-		}
-	}
 
 	result := tx.Model(xray.ClientTraffic{}).
 		Where("((total > 0 and up + down >= total) or (expiry_time > 0 and expiry_time <= ?)) and enable = ?", now, true).
 		Update("enable", false)
-	err = result.Error
+
 	count := result.RowsAffected
-	return needRestart, count, err
+	if count > 0 {
+		logger.Debugf("Disabled %d client(s) with exceeded limits in DB", count)
+	}
+
+	return count, result.Error
 }
 
 func (s *InboundService) GetInboundTags() (string, error) {
@@ -1755,16 +1740,43 @@ func (s *InboundService) ResetClientTrafficLimitByEmail(clientEmail string, tota
 }
 
 func (s *InboundService) ResetClientTrafficByEmail(clientEmail string) error {
-	db := database.GetDB()
+	traffic, inbound, err := s.GetClientInboundByEmail(clientEmail)
+	if err != nil {
+		return err
+	}
+	if inbound == nil {
+		return common.NewError("Inbound Not Found For Email:", clientEmail)
+	}
 
-	// Reset traffic stats in ClientTraffic table
+	wasDisabled := traffic != nil && !traffic.Enable
+
+	db := database.GetDB()
 	result := db.Model(xray.ClientTraffic{}).
 		Where("email = ?", clientEmail).
 		Updates(map[string]any{"enable": true, "up": 0, "down": 0})
 
-	err := result.Error
+	err = result.Error
 	if err != nil {
 		return err
+	}
+
+	if wasDisabled && s.xrayApi != nil && traffic != nil {
+		logger.Debugf("Client %s was disabled, re-adding to Xray after traffic reset", clientEmail)
+		clients, err := s.GetClients(inbound)
+		if err != nil {
+			logger.Warning("Failed to get clients for re-enable:", err)
+			return err
+		}
+		for _, client := range clients {
+			if client.Email == clientEmail && client.Enable {
+				if err := s.addClientToXray(inbound, &client); err == nil {
+					logger.Info("Client re-enabled after traffic reset:", clientEmail)
+				} else {
+					logger.Warning("Failed to re-enable client:", clientEmail, "-", err)
+				}
+				break
+			}
+		}
 	}
 
 	return nil
@@ -1789,24 +1801,7 @@ func (s *InboundService) ResetClientTraffic(id int, clientEmail string) (bool, e
 		}
 		for _, client := range clients {
 			if client.Email == clientEmail && client.Enable {
-				cipher := ""
-				if string(inbound.Protocol) == "shadowsocks" {
-					var oldSettings map[string]any
-					err = json.Unmarshal([]byte(inbound.Settings), &oldSettings)
-					if err != nil {
-						return false, err
-					}
-					cipher = oldSettings["method"].(string)
-				}
-				err1 := s.xrayApi.AddUser(string(inbound.Protocol), inbound.Tag, map[string]any{
-					"email":    client.Email,
-					"id":       client.ID,
-					"security": client.Security,
-					"flow":     client.Flow,
-					"password": client.Password,
-					"cipher":   cipher,
-				})
-				if err1 == nil {
+				if err1 := s.addClientToXray(inbound, &client); err1 == nil {
 					logger.Debug("Client enabled due to reset traffic:", clientEmail)
 				} else {
 					logger.Debug("Error in enabling client by api:", err1)

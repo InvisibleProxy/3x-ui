@@ -287,8 +287,8 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 // which the panel relies on for periodic maintenance and monitoring.
 func (s *Server) startTask() {
 	// Xray monitoring and sync jobs
-	s.cron.AddJob("@every 10s", job.NewXrayTrafficJob(s.xrayService))
-	s.cron.AddJob("@every 30s", job.NewXrayConfigSyncJob(s.xrayService))
+	s.cron.AddJob("@every 10s", job.NewCollectTraffic(s.xrayService))
+	s.cron.AddJob("@every 30s", job.NewSyncXray(s.xrayService))
 
 	// check client ips from log file every 10 sec
 	s.cron.AddJob("@every 10s", job.NewCheckClientIpJob())

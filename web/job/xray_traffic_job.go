@@ -10,57 +10,72 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-// XrayTrafficJob collects and processes traffic statistics from Xray.
-type XrayTrafficJob struct {
+type CollectTraffic struct {
 	settingService  service.SettingService
 	xrayService     *service.XrayService
 	inboundService  service.InboundService
 	outboundService service.OutboundService
 }
 
-// NewXrayTrafficJob creates a new traffic collection job instance.
-func NewXrayTrafficJob(xrayService *service.XrayService) *XrayTrafficJob {
-	return &XrayTrafficJob{
+func NewCollectTraffic(xrayService *service.XrayService) *CollectTraffic {
+	job := &CollectTraffic{
 		xrayService: xrayService,
 	}
+
+	if xrayService != nil && xrayService.GetXrayAPI() != nil {
+		job.inboundService.SetXrayAPI(xrayService.GetXrayAPI())
+		job.outboundService.SetXrayAPI(xrayService.GetXrayAPI())
+	}
+
+	return job
 }
 
-// Run collects traffic statistics from Xray and updates the database.
-func (j *XrayTrafficJob) Run() {
-	traffics, clientTraffics, err := j.xrayService.GetXrayTraffic()
+// Run collects traffic statistics from Xray and updates DB.
+// Called every 10 seconds for traffic monitoring.
+//
+// Business logic:
+// 1. Gets traffic statistics from Xray (inbounds + clients)
+// 2. Updates statistics in DB via inboundService.ProcessTrafficStats:
+//   - Updates traffic counters for inbounds and clients
+//   - Auto-renews clients (if configured)
+//   - Disables clients with exceeded limits
+//   - Disables inbounds with exceeded limits
+//
+// 3. Updates outbound statistics via outboundService.AddTraffic
+// 4. Sends statistics to external API (if configured)
+func (j *CollectTraffic) Run() {
+	traffics, clientTraffics, err := j.xrayService.GetTraffic()
 	if err != nil {
+		logger.Debug("Failed to get Xray traffic stats:", err)
 		return
 	}
 
-	// Update inbound traffic in database
-	err, _ = j.inboundService.AddTraffic(traffics, clientTraffics)
+	err = j.inboundService.ProcessTrafficStats(traffics, clientTraffics)
 	if err != nil {
-		logger.Warning("add inbound traffic failed:", err)
+		logger.Warning("Failed to update inbound traffic:", err)
 	}
 
-	// Update outbound traffic in database
 	err, _ = j.outboundService.AddTraffic(traffics, clientTraffics)
 	if err != nil {
-		logger.Warning("add outbound traffic failed:", err)
+		logger.Warning("Failed to update outbound traffic:", err)
 	}
 
-	// Send traffic to external API if enabled
 	if externalEnabled, err := j.settingService.GetExternalTrafficInformEnable(); externalEnabled {
 		j.informTrafficToExternalAPI(traffics, clientTraffics)
 	} else if err != nil {
-		logger.Warning("get ExternalTrafficInformEnable failed:", err)
+		logger.Warning("Failed to get ExternalTrafficInformEnable:", err)
 	}
 }
 
-func (j *XrayTrafficJob) informTrafficToExternalAPI(inboundTraffics []*xray.Traffic, clientTraffics []*xray.ClientTraffic) {
+// informTrafficToExternalAPI sends traffic statistics to external API.
+// Used for integration with external monitoring systems.
+func (j *CollectTraffic) informTrafficToExternalAPI(inboundTraffics []*xray.Traffic, clientTraffics []*xray.ClientTraffic) {
 	informURL, err := j.settingService.GetExternalTrafficInformURI()
 	if err != nil {
-		logger.Warning("get ExternalTrafficInformURI failed:", err)
 		return
 	}
 	requestBody, err := json.Marshal(map[string]any{"clientTraffics": clientTraffics, "inboundTraffics": inboundTraffics})
 	if err != nil {
-		logger.Warning("parse client/inbound traffic failed:", err)
 		return
 	}
 	request := fasthttp.AcquireRequest()
@@ -71,7 +86,5 @@ func (j *XrayTrafficJob) informTrafficToExternalAPI(inboundTraffics []*xray.Traf
 	request.SetRequestURI(informURL)
 	response := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseResponse(response)
-	if err := fasthttp.Do(request, response); err != nil {
-		logger.Warning("POST ExternalTrafficInformURI failed:", err)
-	}
+	fasthttp.Do(request, response)
 }

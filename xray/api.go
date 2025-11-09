@@ -274,6 +274,29 @@ func (x *XrayAPI) ListOutboundTags() ([]string, error) {
 	return tags, nil
 }
 
+// GetInboundUsers returns list of users (emails) for specified inbound.
+// This returns ACTUAL users currently in Xray, not just traffic statistics.
+func (x *XrayAPI) GetInboundUsers(inboundTag string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := x.HandlerServiceClient.GetInboundUsers(ctx, &command.GetInboundUserRequest{
+		Tag: inboundTag,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get inbound users: %w", err)
+	}
+
+	emails := make([]string, 0, len(resp.Users))
+	for _, user := range resp.Users {
+		if user != nil && user.Email != "" {
+			emails = append(emails, user.Email)
+		}
+	}
+
+	return emails, nil
+}
+
 // GetTraffic retrieves traffic statistics, optionally resetting counters.
 func (x *XrayAPI) GetTraffic(reset bool) ([]*Traffic, []*ClientTraffic, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

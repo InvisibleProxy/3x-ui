@@ -109,7 +109,7 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 		return nil, err
 	}
 
-	inboundConfigs, err := s.buildInboundsConfig()
+	inboundConfigs, err := s.BuildInboundsConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -123,10 +123,26 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 	return xrayConfig, nil
 }
 
-// buildInboundsConfig builds inbound configurations from DB with client filtering and cleanup.
-func (s *XrayService) buildInboundsConfig() ([]xray.InboundConfig, error) {
-	s.inboundService.AddTraffic(nil, nil)
-
+// BuildInboundsConfig builds Xray inbound configurations from database.
+// Called on Xray start/reload to generate actual configuration.
+//
+// Business logic (for each enabled inbound):
+// 1. Loads all inbounds from DB
+// 2. Parses settings JSON and extracts client list
+// 3. Filters clients:
+//   - Removes clients with enable=false
+//   - Removes clients with exceeded traffic (up+down >= total)
+//
+// 4. Cleans client config (keeps only: email, id, password, flow, method)
+// 5. Normalizes flow
+// 6. Processes streamSettings:
+//   - Removes sensitive fields (settings from tls/reality)
+//   - Removes externalProxy
+//
+// 7. Generates final Xray configuration
+//
+// Returns: (array of inbound configs, error)
+func (s *XrayService) BuildInboundsConfig() ([]xray.InboundConfig, error) {
 	inbounds, err := s.inboundService.GetAllInbounds()
 	if err != nil {
 		return nil, err
@@ -142,23 +158,31 @@ func (s *XrayService) buildInboundsConfig() ([]xray.InboundConfig, error) {
 		json.Unmarshal([]byte(inbound.Settings), &settings)
 		clients, ok := settings["clients"].([]any)
 		if ok {
-			// check users active or not
 			clientStats := inbound.ClientStats
-			for _, clientTraffic := range clientStats {
-				indexDecrease := 0
-				for index, client := range clients {
-					c := client.(map[string]any)
-					if c["email"] == clientTraffic.Email {
-						if !clientTraffic.Enable {
-							clients = append(clients[:index-indexDecrease], clients[index-indexDecrease+1:]...)
-							indexDecrease++
-							logger.Infof("Remove Inbound User %s due to expiration or traffic limit", c["email"])
+
+			// Remove clients with exceeded limits or expired
+			for i := len(clients) - 1; i >= 0; i-- {
+				client := clients[i]
+				c := client.(map[string]any)
+				email, ok := c["email"].(string)
+				if !ok {
+					continue
+				}
+
+				for _, clientTraffic := range clientStats {
+					if clientTraffic.Email == email {
+						trafficExceeded := clientTraffic.Total > 0 && (clientTraffic.Up+clientTraffic.Down) >= clientTraffic.Total
+
+						if !clientTraffic.Enable || trafficExceeded {
+							logger.Infof("Remove Inbound User %s due to expiration or traffic limit", email)
+							clients = append(clients[:i], clients[i+1:]...)
 						}
+						break
 					}
 				}
 			}
 
-			// clear client config for additional parameters
+			// Clear client config for additional parameters
 			var final_clients []any
 			for _, client := range clients {
 				c := client.(map[string]any)
@@ -244,8 +268,8 @@ func (s *XrayService) buildOutboundsConfig() ([]xray.OutboundConfig, error) {
 	return outboundConfigs, nil
 }
 
-// GetXrayTraffic retrieves traffic statistics.
-func (s *XrayService) GetXrayTraffic() ([]*xray.Traffic, []*xray.ClientTraffic, error) {
+// GetTraffic retrieves traffic statistics.
+func (s *XrayService) GetTraffic() ([]*xray.Traffic, []*xray.ClientTraffic, error) {
 	if s.xrayAPI == nil {
 		return nil, nil, errors.New("xray API not initialized")
 	}

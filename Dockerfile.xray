@@ -43,9 +43,6 @@ RUN apk add --no-cache ca-certificates tzdata bash && \
 COPY --from=downloader /usr/bin/xray /usr/bin/xray
 COPY --from=downloader /usr/share/xray/*.dat /usr/local/share/xray/
 
-# Copy default config
-COPY xray.config.json /etc/xray/config.json
-
 ARG XRAY_VERSION=25.10.15
 ENV TZ=Asia/Tehran
 ENV XRAY_CORE_VERSION=${XRAY_VERSION}

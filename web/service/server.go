@@ -648,20 +648,16 @@ func (s *ServerService) RestartXrayService() error {
 
 // restartInbounds adds all enabled inbounds from DB to Xray.
 func (s *ServerService) restartInbounds(xrayAPI *xray.XrayAPI) (int, int) {
-	allInbounds, err := s.inboundService.GetAllInbounds()
+	inboundConfigs, err := s.xrayService.BuildInboundsConfig()
 	if err != nil {
-		logger.Error("[RESTART] Failed to load inbounds:", err)
+		logger.Error("[RESTART] Failed to build inbounds config:", err)
 		return 0, 0
 	}
 
 	addedCount := 0
 	failedCount := 0
-	for _, inbound := range allInbounds {
-		if !inbound.Enable {
-			continue
-		}
-
-		inboundJson, err := json.MarshalIndent(inbound.GenXrayInboundConfig(), "", "  ")
+	for _, inboundConfig := range inboundConfigs {
+		inboundJson, err := json.MarshalIndent(inboundConfig, "", "  ")
 		if err != nil {
 			failedCount++
 			continue
@@ -670,7 +666,7 @@ func (s *ServerService) restartInbounds(xrayAPI *xray.XrayAPI) (int, int) {
 		if xrayAPI.AddInbound(inboundJson) == nil {
 			addedCount++
 		} else {
-			logger.Warning("[RESTART] Failed to add inbound", inbound.Tag)
+			logger.Warning("[RESTART] Failed to add inbound", inboundConfig.Tag)
 			failedCount++
 		}
 	}
