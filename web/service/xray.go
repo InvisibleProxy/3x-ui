@@ -395,6 +395,10 @@ func (s *XrayService) ApplyVirtualConfig(newConfigStr string) error {
 		}
 	}
 
+	if len(newConfig.RouterConfig) > 0 && s.xrayAPI != nil {
+		s.syncRoutingRulesFromConfig(newConfig.RouterConfig)
+	}
+
 	return nil
 }
 

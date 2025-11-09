@@ -289,6 +289,7 @@ func (s *Server) startTask() {
 	// Xray monitoring and sync jobs
 	s.cron.AddJob("@every 10s", job.NewCollectTraffic(s.xrayService))
 	s.cron.AddJob("@every 30s", job.NewSyncXray(s.xrayService))
+	s.cron.AddJob("@every 1m", job.NewSyncRoutingRules(s.xrayService))
 
 	// check client ips from log file every 10 sec
 	s.cron.AddJob("@every 10s", job.NewCheckClientIpJob())

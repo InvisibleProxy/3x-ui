@@ -336,6 +336,19 @@ func (s *SettingService) SetXrayEnabled(enabled bool) error {
 	return s.setBool("xrayEnabled", enabled)
 }
 
+// GetRoutingConfig retrieves the routing configuration from database.
+func (s *SettingService) GetRoutingConfig() ([]byte, error) {
+	db := database.GetDB()
+	routingBytes, err := database.GetJSON(db, model.KeyRouting)
+	if err != nil {
+		if database.IsNotFound(err) {
+			return []byte("{}"), nil
+		}
+		return nil, err
+	}
+	return routingBytes, nil
+}
+
 func (s *SettingService) GetListen() (string, error) {
 	return s.getString("webListen")
 }

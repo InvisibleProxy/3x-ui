@@ -11,7 +11,8 @@
     "services": [
       "HandlerService",
       "LoggerService",
-      "StatsService"
+      "StatsService",
+      "RoutingService"
     ]
   },
   "inbounds": [
@@ -59,25 +60,20 @@
     "domainStrategy": "AsIs",
     "rules": [
       {
+        "ruleTag": "block-private-ip",
         "type": "field",
-        "inboundTag": [
-          "api"
-        ],
-        "outboundTag": "api"
-      },
-      {
-        "type": "field",
-        "outboundTag": "blocked",
         "ip": [
           "geoip:private"
-        ]
+        ],
+        "outboundTag": "blocked"
       },
       {
+        "ruleTag": "block-bittorrent",
         "type": "field",
-        "outboundTag": "blocked",
         "protocol": [
           "bittorrent"
-        ]
+        ],
+        "outboundTag": "blocked"
       }
     ]
   },

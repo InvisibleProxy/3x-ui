@@ -10,6 +10,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/logger"
 
 	"github.com/xtls/xray-core/app/proxyman/command"
+	routerCommand "github.com/xtls/xray-core/app/router/command"
 	statsService "github.com/xtls/xray-core/app/stats/command"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
@@ -32,6 +33,7 @@ const (
 type XrayAPI struct {
 	HandlerServiceClient command.HandlerServiceClient
 	StatsServiceClient   statsService.StatsServiceClient
+	RoutingServiceClient routerCommand.RoutingServiceClient
 	grpcClient           *grpc.ClientConn
 }
 
@@ -50,6 +52,7 @@ func NewXrayAPI(host string, port int) (*XrayAPI, error) {
 		grpcClient:           conn,
 		HandlerServiceClient: command.NewHandlerServiceClient(conn),
 		StatsServiceClient:   statsService.NewStatsServiceClient(conn),
+		RoutingServiceClient: routerCommand.NewRoutingServiceClient(conn),
 	}
 
 	logger.Info("Xray connection established")
